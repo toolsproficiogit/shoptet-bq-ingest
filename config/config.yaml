@@ -1,0 +1,6 @@
+pipelines:
+  - id: example_pipeline
+    csv_url: https://example.com/shoptet.csv
+    bq_table_id: your-project.dataset.table
+    load_mode: auto
+    window_days: 30

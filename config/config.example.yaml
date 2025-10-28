@@ -1,0 +1,14 @@
+# Define any number of pipelines. Each runs sequentially when you hit /run
+pipelines:
+- id: business1
+csv_url: https://example.com/shoptet_orders_business1.csv
+bq_table_id: your-project.sales.orders_core
+load_mode: auto # auto|full|window (auto = full if empty, else window)
+window_days: 30 # only used in window/auto
+
+
+- id: business2
+csv_url: https://example.com/shoptet_orders_business2.csv
+bq_table_id: your-project.sales.shipping_fees
+load_mode: window
+window_days: 14
