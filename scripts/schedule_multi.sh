@@ -1,38 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "$(dirname "$0")/helpers.sh"
-need gcloud
 
+prompt() { read -rp "$1: " REPLY && echo "$REPLY"; }
 
-read -rp "Project ID: " PROJECT_ID
-read -rp "Region (e.g. europe-central2): " REGION
-read -rp "Service name [shoptet-bq-multi]: " SERVICE; SERVICE=${SERVICE:-shoptet-bq-multi}
-read -rp "Job name [shoptet-bq-multi-daily]: " JOB; JOB=${JOB:-shoptet-bq-multi-daily}
-read -rp "Cron (e.g. '0 5 * * *'): " CRON
-read -rp "(Optional) Specific pipeline id to run (blank for all): " PID
+PROJECT_ID=${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}
+if [[ -z "${PROJECT_ID}" ]]; then PROJECT_ID=$(prompt "Project ID"); fi
+REGION=${REGION:-$(prompt "Region (e.g. europe-west1)")}
+SERVICE=${SERVICE:-$(prompt "Service name (e.g. shoptet-bq-multi)")}
+JOB=${JOB:-$(prompt "Scheduler job name (e.g. shoptet-bq-daily)")}
+CRON=${CRON:-$(prompt "Cron (UTC), e.g. '0 6 * * *' for 06:00 daily")}
+PIPELINE_ID=${PIPELINE_ID:-$(prompt "Optional pipeline id (leave blank for ALL)")}
 
+SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
 
-URL=$(get_service_url "$SERVICE" "$REGION")
-[[ -n "$PID" ]] && URL="${URL}/run?pipeline=${PID}" || URL="${URL}/run"
-SA=shoptet-bq-invoker
-SA_EMAIL="$SA@${PROJECT_ID}.iam.gserviceaccount.com"
+SA_NAME="shoptet-bq-invoker"
+SA="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
+echo "Creating/ensuring invoker service account ${SA} ..."
+gcloud iam service-accounts create "${SA_NAME}" --display-name "Shoptet BQ Invoker" 2>/dev/null || true
+gcloud run services add-iam-policy-binding "${SERVICE}" \
+  --region "${REGION}" \
+  --member "serviceAccount:${SA}" \
+  --role roles/run.invoker \
+  --condition=None
 
-gcloud iam service-accounts create "$SA" --display-name "Shoptet BQ Invoker" || true
+URI="${SERVICE_URL}/run"
+if [[ -n "${PIPELINE_ID}" ]]; then
+  URI="${URI}?pipeline=${PIPELINE_ID}"
+fi
 
+echo "Creating/updating Cloud Scheduler job ${JOB} ..."
+gcloud scheduler jobs delete "${JOB}" --location "${REGION}" -q >/dev/null 2>&1 || true
+gcloud scheduler jobs create http "${JOB}" \
+  --location "${REGION}" \
+  --schedule "${CRON}" \
+  --http-method GET \
+  --uri "${URI}" \
+  --oidc-service-account-email "${SA}"
 
-gcloud run services add-iam-policy-binding "$SERVICE" \
---region "$REGION" \
---member "serviceAccount:${SA_EMAIL}" \
---role roles/run.invoker
-
-
-gcloud scheduler jobs create http "$JOB" \
---location "$REGION" \
---schedule "$CRON" \
---http-method GET \
---uri "$URL" \
---oidc-service-account-email "$SA_EMAIL"
-
-
-echo "Created Scheduler job $JOB -> $CRON (URL: $URL)"
+echo "Done. Job '${JOB}' will call: ${URI}"
