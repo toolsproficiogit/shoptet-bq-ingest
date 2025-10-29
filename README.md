@@ -134,7 +134,7 @@ ID_TOKEN=$(gcloud auth print-identity-token)
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
 ```
 
-| **<YOUR-SERVICE-URL>** | You will see the URL printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: https://load-csv-to-bigquery-111111111111.europe-west1.run.app |
+You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: **https://load-csv-to-bigquery-111111111111.europe-west1.run.app*
 
 Response example:
 ```json
@@ -147,7 +147,7 @@ Response example:
 }
 ```
 
-You can now go to BigQuery UI and check that a table was created within the defined dataset, and that it was populated with data from the CSV  (click on the table and select "Schema" to check that fields and their types match, "Details" to check if the number of rows is correct, and "Preview" to see values).
+You can now verify BigQuery by running the command at the end of this README, or by simply looking in the UI.
 
 ---
 
@@ -207,7 +207,7 @@ Run a **single pipeline** by ID:
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run?pipeline=<PIPELINE_ID>" | jq
 ```
 
-| **<YOUR-SERVICE-URL>** | You will see the URL printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: https://load-csv-to-bigquery-111111111111.europe-west1.run.app |
+You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: **https://load-csv-to-bigquery-111111111111.europe-west1.run.app*
 
 ---
 
