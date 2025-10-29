@@ -1,44 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "$(dirname "$0")/helpers.sh"
-need gcloud
 
+# Remote-only multi-pipeline deploy:
+# - Uploads YAML to GCS and sets CONFIG_URL
+# - Deploys Cloud Run with MULTI_MODE=true
 
-read -rp "Project ID: " PROJECT_ID
-read -rp "Region (e.g. europe-central2): " REGION
-read -rp "Service name [shoptet-bq-multi]: " SERVICE; SERVICE=${SERVICE:-shoptet-bq-multi}
-read -rp "Use baked config (config/config.yaml) or remote URL? [baked/url]: " MODE; MODE=${MODE:-baked}
+prompt() { read -rp "$1: " REPLY && echo "$REPLY"; }
 
+PROJECT_ID=${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}
+if [[ -z "${PROJECT_ID}" ]]; then PROJECT_ID=$(prompt "Project ID"); fi
+REGION=${REGION:-$(prompt "Region (e.g. europe-west1)")}
+SERVICE=${SERVICE:-$(prompt "Service name (e.g. shoptet-bq-multi)")}
+LOCAL_YAML=${LOCAL_YAML:-$(prompt "Local YAML path (e.g. config/config.yaml)")}
+BQ_LOCATION=${BQ_LOCATION:-$(prompt "BigQuery location (e.g. EU)")}
+BUCKET=${BUCKET:-$(prompt "GCS bucket for config (e.g. my-shoptet-configs)")}
+OBJECT=${OBJECT:-$(prompt "GCS object name [shoptet_config.yaml]")}
+OBJECT=${OBJECT:-shoptet_config.yaml}
 
-REPO=containers
+REPO=${REPO:-containers}
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:v1"
 
+echo "Enabling required APIs (idempotent)..."
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com iam.googleapis.com
 
-gcloud config set project "$PROJECT_ID" >/dev/null
-ensure_apis
-ensure_repo "$PROJECT_ID" "$REGION" "$REPO"
+echo "Ensuring Artifact Registry repo '${REPO}' exists in ${REGION}..."
+gcloud artifacts repositories describe "${REPO}" --location "${REGION}" >/dev/null 2>&1 || \
+gcloud artifacts repositories create "${REPO}" --repository-format=docker --location "${REGION}" --description="Containers"
 
+echo "Uploading YAML to gs://${BUCKET}/${OBJECT} ..."
+gsutil mb -p "${PROJECT_ID}" -l "${REGION}" "gs://${BUCKET}" 2>/dev/null || true
+gsutil cp "${LOCAL_YAML}" "gs://${BUCKET}/${OBJECT}"
 
-gcloud builds submit --tag "$IMAGE"
+CONFIG_URL="https://storage.googleapis.com/${BUCKET}/${OBJECT}"
 
+echo "Building image ${IMAGE} ..."
+gcloud builds submit --tag "${IMAGE}"
 
-if [[ $MODE == url ]]; then
-read -rp "Config URL (HTTPS or signed GCS): " CONFIG_URL
-ENVFLAGS="--set-env-vars MULTI_MODE=true,CONFIG_URL=$CONFIG_URL,BQ_LOCATION=EU"
-else
-ENVFLAGS="--set-env-vars MULTI_MODE=true,BQ_LOCATION=EU"
-fi
+echo "Deploying Cloud Run service ${SERVICE} ..."
+gcloud run deploy "${SERVICE}" \
+  --image "${IMAGE}" \
+  --region "${REGION}" \
+  --platform managed \
+  --no-allow-unauthenticated \
+  --set-env-vars MULTI_MODE=true,CONFIG_URL="${CONFIG_URL}",BQ_LOCATION="${BQ_LOCATION}"
 
-
-gcloud run deploy "$SERVICE" \
---image "$IMAGE" \
---platform managed \
---region "$REGION" \
---no-allow-unauthenticated \
-$ENVFLAGS
-
-
-URL=$(get_service_url "$SERVICE" "$REGION")
+SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
 ID_TOKEN=$(gcloud auth print-identity-token)
-echo "Run all pipelines: curl -H 'Authorization: Bearer $ID_TOKEN' ${URL}/run | jq"
-echo "Run one pipeline: curl -H 'Authorization: Bearer $ID_TOKEN' '${URL}/run?pipeline=orders_core' | jq"
+
+echo "Done."
+echo "Service URL: ${SERVICE_URL}"
+echo "Test all pipelines:"
+echo "  curl -s -H 'Authorization: Bearer ${ID_TOKEN}' ${SERVICE_URL}/run | jq"
+echo "Run a single pipeline:"
+echo "  curl -s -H 'Authorization: Bearer ${ID_TOKEN}' \"${SERVICE_URL}/run?pipeline=<PIPELINE_ID>\" | jq"
