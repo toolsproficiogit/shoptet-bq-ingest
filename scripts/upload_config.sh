@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Upload a YAML config to GCS and wire it to a Cloud Run service via CONFIG_URL.
+# Also grants the Cloud Run runtime service account read access to the bucket.
 set -euo pipefail
 
 prompt() { read -rp "$1: " REPLY && echo "$REPLY"; }
@@ -25,6 +26,16 @@ echo "Setting CONFIG_URL on service ${SERVICE} ..."
 gcloud run services update "${SERVICE}" \
   --region "${REGION}" \
   --set-env-vars CONFIG_URL="${CONFIG_URL}",MULTI_MODE=true
+
+# Determine runtime service account (explicit or default)
+RUNTIME_SA=$(gcloud run services describe "${SERVICE}" --region "${REGION}" \
+  --format="value(spec.template.spec.serviceAccountName)")
+if [[ -z "${RUNTIME_SA}" ]]; then
+  PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
+  RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+fi
+echo "Granting objectViewer on gs://${BUCKET} to runtime SA: ${RUNTIME_SA}"
+gsutil iam ch serviceAccount:${RUNTIME_SA}:objectViewer gs://${BUCKET}
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
 ID_TOKEN=$(gcloud auth print-identity-token)
