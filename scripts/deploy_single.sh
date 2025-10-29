@@ -30,7 +30,7 @@ gcloud run deploy "$SERVICE" \
 --image "$IMAGE" \
 --platform managed \
 --region "$REGION" \
---allow-unauthenticated=false \
+--no-allow-unauthenticated \
 --set-env-vars CSV_URL="$CSV_URL",BQ_TABLE_ID="$BQ_TABLE_ID",WINDOW_DAYS="$WINDOW_DAYS",LOAD_MODE="$LOAD_MODE",BQ_LOCATION="$BQ_LOCATION"
 
 
