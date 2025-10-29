@@ -60,27 +60,20 @@ Before starting, ensure your account has the roles below. Without them, deployme
 | `roles/cloudbuild.builds.editor` | Build and push Docker images |
 | `roles/artifactregistry.admin` | Create and manage Artifact Registry repositories |
 | `roles/serviceusage.serviceUsageAdmin` | Enable required APIs |
+| `roles/storage.admin` | Create buckets & upload YAML (remote config) |
 
 ### ✅ Grant the roles (admin or owner runs this)
 
 ```bash
+# Clone repo and make scripts executable
+git clone https://github.com/toolsproficiogit/shoptet-bq-ingest.git
+cd shoptet-bq-ingest
+chmod +x scripts/*.sh
+
+# Grant roles to a specific user (run as Project Owner/Admin)
 PROJECT_ID="<YOUR_PROJECT_ID>"
 USER_EMAIL="<YOUR_EMAIL>"
-
-for ROLE in \
-  roles/run.admin \
-  roles/cloudscheduler.admin \
-  roles/iam.serviceAccountAdmin \
-  roles/iam.serviceAccountUser \
-  roles/cloudbuild.builds.editor \
-  roles/artifactregistry.admin \
-  roles/serviceusage.serviceUsageAdmin
-do
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="user:${USER_EMAIL}" \
-    --role="$ROLE" \
-    --condition=None
-done
+PROJECT_ID="$PROJECT_ID" USER_EMAIL="$USER_EMAIL" ./scripts/grant_permissions.sh
 ```
 
 ### 🔍 Verify your permissions
