@@ -134,7 +134,7 @@ ID_TOKEN=$(gcloud auth print-identity-token)
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
 ```
 
-| **<YOUR-SERVICE-URL>** | You will see the URL printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should have this format: https://load-csv-to-bigquery-111111111111.europe-west1.run.app |
+| **<YOUR-SERVICE-URL>** | You will see the URL printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: https://load-csv-to-bigquery-111111111111.europe-west1.run.app |
 
 Response example:
 ```json
@@ -151,87 +151,51 @@ You can now go to BigQuery UI and check that a table was created within the defi
 
 ---
 
-## 🧩 Multi-Pipeline Setup (many CSVs → many tables)
+## Quick Start — Multi‑Pipeline
 
-A single service runs multiple pipelines defined in a **YAML** file.
+A single service that runs multiple pipelines (CSV links and target tables) defined in a remote **YAML** file. You define settings individually for each pipeline.
 
-### 📘 YAML access modes (choose one)
-
-| Mode | What it means | How you edit later |
-|------|----------------|--------------------|
-| **Baked** | `config/config.yaml` is bundled **inside the container** at build time. | Edit local YAML → **rebuild & redeploy** (or switch to Remote mode). |
-| **Remote** | Service reads YAML from a **URL** (usually GCS) via `CONFIG_URL`. | Edit local YAML → **upload** to GCS (overwrite) → **no redeploy**. |
-
-Check which mode you’re using:
+### 1) Prepare YAML locally
 ```bash
-SERVICE="<SERVICE_NAME>"; REGION="<REGION>"
-gcloud run services describe "$SERVICE" --region "$REGION" --format=json  | jq '.spec.template.spec.containers[0].env'
-# If you see CONFIG_URL -> Remote mode; if absent -> Baked mode
+git clone https://github.com/toolsproficiogit/shoptet-bq-ingest.git
+cd shoptet-bq-ingest
+cp config/config.example.yaml config/config.yaml
+cloudshell edit config/config.yaml     # visual editor opens
+# edit pipelines, Save
 ```
 
-### ✍️ Edit YAML in **Cloud Shell Editor** (non-programmer friendly)
+YAML example:
+```yaml
+pipelines:
+  - id: orders
+    csv_url: https://example.com/orders.csv
+    bq_table_id: myproject.sales.orders
+    load_mode: auto
+    window_days: 30
+  - id: shipping
+    csv_url: https://example.com/shipping.csv
+    bq_table_id: myproject.sales.shipping
+    load_mode: window
+    window_days: 14
+```
 
-1. Open the Editor (top-right “<>” icon) or run:
-   ```bash
-   cloudshell edit config/config.yaml
-   ```
-2. Add/remove pipelines in the YAML.
-3. Save file.
-
-Then follow the steps below based on your mode.
-
-### 🛠 Change pipelines **after deployment** — full process
-
-#### A) If you deployed in **Baked** mode
-1. **Edit YAML**: open `config/config.yaml` in the Editor and save.
-2. **Rebuild & redeploy** (bakes the new YAML):
-   ```bash
-   PROJECT_ID="<PROJECT_ID>"
-   REGION="<REGION>"
-   SERVICE="<SERVICE_NAME>"
-   REPO="containers"
-   IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:v2"
-
-   gcloud builds submit --tag "$IMAGE"
-   gcloud run deploy "$SERVICE"      --image "$IMAGE"      --region "$REGION"      --platform managed      --no-allow-unauthenticated      --set-env-vars MULTI_MODE=true,BQ_LOCATION=<BQ_LOCATION>
-   ```
-3. **Trigger** to verify:
-   ```bash
-   SERVICE_URL="<YOUR_SERVICE_URL>"
-   ID_TOKEN=$(gcloud auth print-identity-token)
-   curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
-   ```
-4. **Tip:** To avoid rebuilds going forward, switch to **Remote** once by running `./scripts/upload_config.sh` (see next case).
-
-#### B) If you deployed in **Remote** mode
-1. **Edit YAML**: open `config/config.yaml` in the Editor and save (or edit any local copy).
-2. **Upload & link** (overwrites GCS object and sets `CONFIG_URL` if needed):
-   ```bash
-   cd scripts
-   ./upload_config.sh
-   ```
-   Prompts for:
-   - Project/Region/Service
-   - Local YAML path (e.g., `config/config.yaml`)
-   - GCS bucket + object name (creates the bucket if missing)
-3. **Trigger** to verify:
-   ```bash
-   SERVICE_URL="<YOUR_SERVICE_URL>"
-   ID_TOKEN=$(gcloud auth print-identity-token)
-   curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
-   ```
-
-> You can also upload directly with `gsutil cp config/config.yaml gs://<BUCKET>/<OBJECT>` if `CONFIG_URL` is already set on the service.
-
-### 📦 Deploy multi for the first time
-
+### 2) Deploy (uploads YAML to GCS, sets CONFIG_URL, deploys service)
 ```bash
 chmod +x scripts/*.sh
 ./scripts/deploy_multi.sh
-# Choose "baked" or "url" (remote). If "url", you'll provide CONFIG_URL later via upload_config.sh.
 ```
+The script will prompt for:
+- Project, Region, Service name
+- **Local YAML path** (e.g., `config/config.yaml`)
+- **GCS bucket** (will be created if missing)
+- **Object name** (e.g., `shoptet_config.yaml`)
 
-Trigger all pipelines:
+It will:
+1) Upload the YAML to `gs://<bucket>/<object>`  
+2) Deploy Cloud Run with `MULTI_MODE=true` and `CONFIG_URL=https://storage.googleapis.com/<bucket>/<object>`  
+3) Print the service URL and a test `curl`
+
+### 3) Trigger test (all pipelines)
 ```bash
 SERVICE_URL="<YOUR_SERVICE_URL>"
 ID_TOKEN=$(gcloud auth print-identity-token)
@@ -243,28 +207,56 @@ Run a **single pipeline** by ID:
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run?pipeline=<PIPELINE_ID>" | jq
 ```
 
+| **<YOUR-SERVICE-URL>** | You will see the URL printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: https://load-csv-to-bigquery-111111111111.europe-west1.run.app |
+
 ---
 
-| **<YOUR-SERVICE-URL>** | An URL that will trigger the run, you will see it printed in the Cloud Shell after the service is deployed. Alternatively, you can check it in the UI, if you go Cloud Run > Services > load-csv-to-bigquery (or a different name you entered for the service name) > URL is displayed at the top |
+## Add/Remove Pipelines on an already-deployed service
 
-Response example:
-```json
-{
-  "status": "ok",
-  "message": "Ingest complete",
-  "parsed_rows": 400,
-  "kept_rows": 398,
-  "mode": "auto"
-}
+You deployed previously, and the service is running. Now you want to change pipelines. Start a **new Cloud Shell session** (described at the start of the README). 
+
+### A) Find the CONFIG_URL
+```bash
+SERVICE="<SERVICE_NAME>"     # e.g., shoptet-bq-multi
+REGION="<REGION>"            # e.g., europe-west1
+gcloud run services describe "$SERVICE" --region "$REGION" --format=json   | jq '.spec.template.spec.containers[0].env'
+
+# Pull just the URL
+CONFIG_URL=$(gcloud run services describe "$SERVICE" --region "$REGION"   --format="value(spec.template.spec.containers[0].env.list().filter(env, env.name='CONFIG_URL').0.value)")
+echo "$CONFIG_URL"
 ```
 
-You can now go to BigQuery UI and check that tables were created within the defined datasets, and that they were populated with data from the CSVs (click on the table and select "Schema" to check that fields and their types match, "Details" to check if the number of rows is correct, and "Preview" to see values).
+Extract bucket/object (optional):
+```bash
+BUCKET=$(echo "$CONFIG_URL" | sed -E 's#https?://storage.googleapis.com/([^/]+)/.*#\1#')
+OBJECT=$(echo "$CONFIG_URL" | sed -E 's#https?://storage.googleapis.com/[^/]+/(.*)#\1#')
+echo "Bucket=$BUCKET  Object=$OBJECT"
+```
+
+### B) Download, edit visually, re‑upload
+```bash
+mkdir -p config
+gsutil cp "gs://${BUCKET}/${OBJECT}" config/config.yaml
+
+cloudshell edit config/config.yaml    # add/remove pipelines, Save
+
+gsutil cp config/config.yaml "gs://${BUCKET}/${OBJECT}"
+```
+
+### C) Trigger and verify
+```bash
+SERVICE_URL="<YOUR_SERVICE_URL>"
+ID_TOKEN=$(gcloud auth print-identity-token)
+curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
+```
+
+> Scheduler jobs do **not** need changes. Next scheduled run uses the new YAML.
 
 ---
 
 ## ⏰ Scheduling (Automation)
 
-Here you can select refresh frequency with which the BigQuery table will be updated. You can choose anywhere between 
+Here you can select refresh frequency with which the BigQuery table will be updated. 
 
 ### 🔹 Single-pipeline schedule
 
@@ -303,62 +295,12 @@ Examples of useful, ready-to-use Cron expressions for this deployment:
 
 ---
 
-## 🔁 Managing Pipelines After Deployment (Multi-mode)
-
-### ➕ Add a pipeline
-Edit `config/config.yaml` or upload an updated YAML using:
-
-```bash
-cd scripts
-./upload_config.sh
-```
-
-This uploads your local YAML to a Google Cloud Storage bucket and links it to the service.
-
-### 🗑 Remove or modify a pipeline
-Just edit the YAML (locally or remotely hosted) and re-run `upload_config.sh` — the next scheduled or manual run will apply changes.
-
-### 🔁 Force reload of all data
-Temporarily set:
-```bash
-gcloud run services update <SERVICE_NAME>   --region <REGION>   --set-env-vars LOAD_MODE=full
-```
-Then run `/run` manually once, and revert to `LOAD_MODE=auto`.
-
----
-
-## 🧾 Verify & Trigger Manually
-
-```bash
-SERVICE_URL="<YOUR_SERVICE_URL>"
-ID_TOKEN=$(gcloud auth print-identity-token)
-curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
-```
-
-To run a single pipeline in multi-mode:
-```bash
-curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run?pipeline=<PIPELINE_ID>" | jq
-```
-
----
-
-## 🧹 Teardown (Clean up)
-
-### 🔻 Delete Scheduler job and Cloud Run service
+## Teardown (clean-up)
 
 ```bash
 cd scripts
 ./teardown.sh
-```
 
-Prompts for:
-- Project ID
-- Region
-- Service name (e.g., `shoptet-bq-ingest`)
-- Scheduler job name (optional)
-
-Manually verify cleanup:
-```bash
 gcloud run services list --region <REGION>
 gcloud scheduler jobs list --location <REGION>
 ```
@@ -374,20 +316,6 @@ SELECT * FROM `<PROJECT>.<DATASET>.<TABLE>`
 ORDER BY date DESC
 LIMIT 20;
 ```
-
----
-
-## 💡 Summary of Key Commands
-
-| Action | Command |
-|---------|----------|
-| Test service | `curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" "<SERVICE_URL>/run" | jq` |
-| Deploy single | `./scripts/deploy_single.sh` |
-| Deploy multi | `./scripts/deploy_multi.sh` |
-| Schedule single | `./scripts/schedule_single.sh` |
-| Schedule multi | `./scripts/schedule_multi.sh` |
-| Upload YAML config | `./scripts/upload_config.sh` |
-| Delete service/schedule | `./scripts/teardown.sh` |
 
 ---
 
