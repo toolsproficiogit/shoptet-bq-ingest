@@ -134,7 +134,7 @@ ID_TOKEN=$(gcloud auth print-identity-token)
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
 ```
 
-You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: **https://load-csv-to-bigquery-111111111111.europe-west1.run.app*
+You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: https://load-csv-to-bigquery-111111111111.europe-west1.run.app
 
 Response example:
 ```json
@@ -207,7 +207,7 @@ Run a **single pipeline** by ID:
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run?pipeline=<PIPELINE_ID>" | jq
 ```
 
-You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: **https://load-csv-to-bigquery-111111111111.europe-west1.run.app*
+You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top. It should look like this: https://load-csv-to-bigquery-111111111111.europe-west1.run.app
 
 ---
 
