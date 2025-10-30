@@ -6,7 +6,7 @@ import sys
 import json
 import time
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 
 import requests
@@ -28,7 +28,7 @@ app = Flask(__name__)
 # -------- Helpers --------
 def parse_gcs_from_https(url: str) -> Optional[Tuple[str, str]]:
     """
-    If url is like https://storage.googleapis.com/<bucket>/<object>, return (bucket, object)
+    Map https://storage.googleapis.com/<bucket>/<object> to (bucket, object)
     """
     m = re.match(r"^https?://storage\.googleapis\.com/([^/]+)/(.*)$", url)
     if m:
@@ -38,9 +38,10 @@ def parse_gcs_from_https(url: str) -> Optional[Tuple[str, str]]:
 def fetch_text_from_url(url: str, timeout=120) -> str:
     """
     Fetch YAML/CSV text from HTTPS or GCS using ADC.
-    - HTTPS GCS (storage.googleapis.com): prefer Storage API to support private objects
+    - HTTPS GCS (storage.googleapis.com): prefer Storage API (private objects OK)
     - gs:// URI: use Storage API
-    - Other HTTPS: use requests (assumes public or signed URL)
+    - Other HTTPS: use requests (public/signed URL)
+    Always decode with UTF-8-SIG to drop BOM if present.
     """
     if url.startswith("gs://"):
         bucket_name, blob_name = url[5:].split("/", 1)
@@ -51,23 +52,19 @@ def fetch_text_from_url(url: str, timeout=120) -> str:
         bucket_name, blob_name = gcs_pair
         client = storage.Client()
         return client.bucket(bucket_name).blob(blob_name).download_as_text(encoding="utf-8")
-    # Generic HTTPS
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
-    # Use utf-8-sig to drop BOM if present
     return r.content.decode("utf-8-sig")
 
 def decimal_comma_to_float(s: str) -> Optional[float]:
     """
-    Convert European decimal string (e.g., '1.234,56' or '3380,17') to float.
-    Returns None if blank or unparsable.
+    Convert '1.234,56' / '3380,17' -> float. Return None if blank/unparsable.
     """
     if s is None:
         return None
     s = s.strip().strip('"').strip("'")
     if s == "" or s.lower() in {"na", "nan", "null"}:
         return None
-    # normalize thousands '.' and decimal ','
     normalized = s.replace(".", "").replace(",", ".")
     try:
         return float(normalized)
@@ -75,10 +72,12 @@ def decimal_comma_to_float(s: str) -> Optional[float]:
         return None
 
 def parse_datetime(s: str) -> Optional[datetime]:
+    """
+    Parse 'YYYY-MM-DD HH:MM:SS' -> datetime (naive).
+    """
     if not s:
         return None
     s = s.strip().strip('"').strip("'")
-    # expected 'YYYY-MM-DD HH:MM:SS'
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except ValueError:
@@ -110,7 +109,7 @@ def read_shoptet_csv(csv_text: str) -> Tuple[List[Dict[str, Any]], List[str], Li
 def filter_by_window(rows: List[Dict[str, Any]], date_col: str, days: int) -> List[Dict[str, Any]]:
     if days <= 0:
         return rows
-    cutoff = datetime.now().replace(tzinfo=None) - timedelta(days=days)
+    cutoff = datetime.now() - timedelta(days=days)
     out = []
     for r in rows:
         dt = parse_datetime(r.get(date_col))
@@ -123,8 +122,7 @@ def bq_client() -> bigquery.Client:
 
 def ensure_table(bq: bigquery.Client, table_id: str, location: str) -> bigquery.Table:
     """
-    Ensure target table exists with expected schema. Keep column names from CSV.
-    Schema:
+    Ensure target table exists (schema kept simple & fixed):
       - date: DATETIME
       - orderItemType: STRING
       - orderItemTotalPriceWithoutVat: FLOAT
@@ -132,8 +130,6 @@ def ensure_table(bq: bigquery.Client, table_id: str, location: str) -> bigquery.
     try:
         return bq.get_table(table_id)
     except NotFound:
-        dataset_id = ".".join(table_id.split(".")[:2])
-        # Table schema
         schema = [
             bigquery.SchemaField("date", "DATETIME"),
             bigquery.SchemaField("orderItemType", "STRING"),
@@ -148,6 +144,20 @@ def is_table_empty(bq: bigquery.Client, table_id: str) -> bool:
     query = f"SELECT COUNT(1) AS c FROM `{table_id}`"
     res = list(bq.query(query).result())
     return res[0]["c"] == 0
+
+def _coerce_rows_for_bq(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert Python types to JSON-serializable values BigQuery accepts.
+    - datetime -> 'YYYY-MM-DD HH:MM:SS'
+    """
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rr = dict(r)
+        dt = rr.get("date")
+        if isinstance(dt, datetime):
+            rr["date"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+        out.append(rr)
+    return out
 
 def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_table: str, location: str) -> Optional[str]:
     """
@@ -164,20 +174,21 @@ def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_tabl
         bigquery.SchemaField("orderItemTotalPriceWithoutVat", "FLOAT"),
     ]
     bq.create_table(bigquery.Table(staging, schema=schema))
-    job = bq.load_table_from_json(rows, staging, location=location)
+
+    # Coerce datetimes to strings before JSON load
+    json_rows = _coerce_rows_for_bq(rows)
+
+    job = bq.load_table_from_json(json_rows, staging, location=location)
     job.result()
-    log.info("Loaded %d rows to staging %s", len(rows), staging)
+    log.info("Loaded %d rows to staging %s", len(json_rows), staging)
     return staging
 
 def merge_staging(bq: bigquery.Client, staging: str, target: str, location: str) -> Tuple[int, int]:
     """
-    MERGE staging into target on (date, orderItemType). Update price if changed, insert new.
-    Returns (updated_count, inserted_count)
+    MERGE staging into target on (date, orderItemType). Update price if changed; insert new.
+    Returns (updated_count, inserted_count) — we return (0,0) as placeholders.
     """
     query = f"""
-    DECLARE updated_count INT64 DEFAULT 0;
-    DECLARE inserted_count INT64 DEFAULT 0;
-
     MERGE `{target}` T
     USING `{staging}` S
     ON T.date = S.date AND T.orderItemType = S.orderItemType
@@ -186,16 +197,9 @@ def merge_staging(bq: bigquery.Client, staging: str, target: str, location: str)
     WHEN NOT MATCHED THEN
       INSERT (date, orderItemType, orderItemTotalPriceWithoutVat)
       VALUES (S.date, S.orderItemType, S.orderItemTotalPriceWithoutVat);
-
-    -- Return counts
-    SELECT
-      (SELECT COUNT(*) FROM `{target}`) AS dummy_total; -- placeholder to force completion
     """
-    # We can't directly return counts from MERGE easily; as a proxy we compute by comparing pre/post if needed.
-    # For simplicity, we won't compute exact counts here.
     bq.query(query, location=location).result()
-
-    # Drop staging
+    # Drop staging regardless of MERGE success to avoid clutter (MERGE already completed if we got here)
     bq.delete_table(staging, not_found_ok=True)
     return 0, 0
 
@@ -204,7 +208,7 @@ def health_checks(parsed: List[Dict[str, Any]], kept: List[Dict[str, Any]]) -> L
     if not parsed:
         issues.append("No rows parsed.")
         return issues
-    # Duplicate keys in kept rows
+    # Duplicate composite keys in kept rows (date, orderItemType)
     seen = set()
     dups = 0
     for r in kept:
@@ -226,8 +230,9 @@ def health_checks(parsed: List[Dict[str, Any]], kept: List[Dict[str, Any]]) -> L
 
 def process_pipeline(p: Dict[str, Any], bq_loc: str) -> Dict[str, Any]:
     """
-    Process one pipeline: fetch CSV, parse, window, load, merge.
-    Expected keys in p: id, csv_url, bq_table_id, load_mode, window_days
+    Process one pipeline: fetch CSV, parse, window/full, load, merge.
+    Required keys in p: id, csv_url, bq_table_id
+    Optional: load_mode (auto|full|window), window_days (int)
     """
     csv_url = p["csv_url"]
     table_id = p["bq_table_id"]
@@ -239,7 +244,7 @@ def process_pipeline(p: Dict[str, Any], bq_loc: str) -> Dict[str, Any]:
     csv_text = fetch_text_from_url(csv_url)
     raw_rows, headers, parse_errors = read_shoptet_csv(csv_text)
 
-    # Standardize / coerce
+    # Coerce & standardize to expected schema
     parsed_rows: List[Dict[str, Any]] = []
     for r in raw_rows:
         dt = parse_datetime(r.get("date"))
@@ -254,22 +259,17 @@ def process_pipeline(p: Dict[str, Any], bq_loc: str) -> Dict[str, Any]:
     bq_cli = bq_client()
     ensure_table(bq_cli, table_id, bq_loc)
 
-    # Determine mode
+    # Resolve mode
     if load_mode not in {"auto", "full", "window"}:
         load_mode = "auto"
-
     if load_mode == "auto":
         empty = is_table_empty(bq_cli, table_id)
         effective_mode = "full" if empty else "window"
     else:
         effective_mode = load_mode
 
-    if effective_mode == "window":
-        kept_rows = filter_by_window(parsed_rows, "date", window_days)
-    else:
-        kept_rows = parsed_rows
-
-    # Remove rows with missing required fields after coercion
+    kept_rows = parsed_rows if effective_mode == "full" else filter_by_window(parsed_rows, "date", window_days)
+    # Remove rows missing required fields after coercion
     kept_rows = [r for r in kept_rows if r["date"] is not None and r["orderItemType"] not in ("", None)]
 
     issues = health_checks(parsed_rows, kept_rows)
@@ -316,7 +316,7 @@ def run_ingest():
             "window_days": int(os.getenv("WINDOW_DAYS", "30")),
         }]
     else:
-        # Multi-pipeline requires CONFIG_URL (remote YAML only)
+        # Multi-pipeline requires CONFIG_URL (remote YAML)
         config_url = os.getenv("CONFIG_URL")
         if not config_url:
             return jsonify({
