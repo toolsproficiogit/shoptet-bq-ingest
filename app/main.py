@@ -7,7 +7,7 @@ import json
 import time
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Union
 
 import requests
 import yaml
@@ -27,22 +27,13 @@ app = Flask(__name__)
 
 # -------- Helpers --------
 def parse_gcs_from_https(url: str) -> Optional[Tuple[str, str]]:
-    """
-    Map https://storage.googleapis.com/<bucket>/<object> to (bucket, object)
-    """
     m = re.match(r"^https?://storage\.googleapis\.com/([^/]+)/(.*)$", url)
     if m:
         return m.group(1), m.group(2)
     return None
 
 def fetch_text_from_url(url: str, timeout=120) -> str:
-    """
-    Fetch YAML/CSV text from HTTPS or GCS using ADC.
-    - HTTPS GCS (storage.googleapis.com): prefer Storage API (private objects OK)
-    - gs:// URI: use Storage API
-    - Other HTTPS: use requests (public/signed URL)
-    Always decode with UTF-8-SIG to drop BOM if present.
-    """
+    # GCS via gs:// or storage.googleapis.com uses Storage API (supports private objects)
     if url.startswith("gs://"):
         bucket_name, blob_name = url[5:].split("/", 1)
         client = storage.Client()
@@ -52,14 +43,12 @@ def fetch_text_from_url(url: str, timeout=120) -> str:
         bucket_name, blob_name = gcs_pair
         client = storage.Client()
         return client.bucket(bucket_name).blob(blob_name).download_as_text(encoding="utf-8")
+    # Generic HTTPS
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
-    return r.content.decode("utf-8-sig")
+    return r.content.decode("utf-8-sig")  # drop BOM if present
 
 def decimal_comma_to_float(s: str) -> Optional[float]:
-    """
-    Convert '1.234,56' / '3380,17' -> float. Return None if blank/unparsable.
-    """
     if s is None:
         return None
     s = s.strip().strip('"').strip("'")
@@ -71,12 +60,14 @@ def decimal_comma_to_float(s: str) -> Optional[float]:
     except ValueError:
         return None
 
-def parse_datetime(s: str) -> Optional[datetime]:
+def parse_datetime(s: Optional[str]) -> Optional[datetime]:
     """
-    Parse 'YYYY-MM-DD HH:MM:SS' -> datetime (naive).
+    Parse 'YYYY-MM-DD HH:MM:SS' -> datetime (naive). If already datetime, pass through.
     """
-    if not s:
+    if s is None:
         return None
+    if isinstance(s, datetime):
+        return s
     s = s.strip().strip('"').strip("'")
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
@@ -107,12 +98,17 @@ def read_shoptet_csv(csv_text: str) -> Tuple[List[Dict[str, Any]], List[str], Li
     return rows, (headers or []), errors
 
 def filter_by_window(rows: List[Dict[str, Any]], date_col: str, days: int) -> List[Dict[str, Any]]:
+    """
+    Keep only rows where date >= now - days.
+    Accepts either str or datetime in rows[date_col].
+    """
     if days <= 0:
         return rows
     cutoff = datetime.now() - timedelta(days=days)
     out = []
     for r in rows:
-        dt = parse_datetime(r.get(date_col))
+        v: Union[str, datetime, None] = r.get(date_col)
+        dt = v if isinstance(v, datetime) else parse_datetime(v)
         if dt and dt >= cutoff:
             out.append(r)
     return out
@@ -121,12 +117,6 @@ def bq_client() -> bigquery.Client:
     return bigquery.Client()
 
 def ensure_table(bq: bigquery.Client, table_id: str, location: str) -> bigquery.Table:
-    """
-    Ensure target table exists (schema kept simple & fixed):
-      - date: DATETIME
-      - orderItemType: STRING
-      - orderItemTotalPriceWithoutVat: FLOAT
-    """
     try:
         return bq.get_table(table_id)
     except NotFound:
@@ -146,10 +136,7 @@ def is_table_empty(bq: bigquery.Client, table_id: str) -> bool:
     return res[0]["c"] == 0
 
 def _coerce_rows_for_bq(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Convert Python types to JSON-serializable values BigQuery accepts.
-    - datetime -> 'YYYY-MM-DD HH:MM:SS'
-    """
+    """Convert Python types to JSON-serializable values BigQuery accepts."""
     out: List[Dict[str, Any]] = []
     for r in rows:
         rr = dict(r)
@@ -160,10 +147,6 @@ def _coerce_rows_for_bq(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_table: str, location: str) -> Optional[str]:
-    """
-    Load JSON rows into a temporary staging table with same schema as target.
-    Returns staging table id or None if nothing to load.
-    """
     if not rows:
         return None
     dataset = ".".join(target_table.split(".")[:2])
@@ -175,7 +158,7 @@ def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_tabl
     ]
     bq.create_table(bigquery.Table(staging, schema=schema))
 
-    # Coerce datetimes to strings before JSON load
+    # Convert datetime objects to strings for JSON load
     json_rows = _coerce_rows_for_bq(rows)
 
     job = bq.load_table_from_json(json_rows, staging, location=location)
@@ -184,10 +167,6 @@ def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_tabl
     return staging
 
 def merge_staging(bq: bigquery.Client, staging: str, target: str, location: str) -> Tuple[int, int]:
-    """
-    MERGE staging into target on (date, orderItemType). Update price if changed; insert new.
-    Returns (updated_count, inserted_count) — we return (0,0) as placeholders.
-    """
     query = f"""
     MERGE `{target}` T
     USING `{staging}` S
@@ -199,7 +178,6 @@ def merge_staging(bq: bigquery.Client, staging: str, target: str, location: str)
       VALUES (S.date, S.orderItemType, S.orderItemTotalPriceWithoutVat);
     """
     bq.query(query, location=location).result()
-    # Drop staging regardless of MERGE success to avoid clutter (MERGE already completed if we got here)
     bq.delete_table(staging, not_found_ok=True)
     return 0, 0
 
@@ -208,7 +186,6 @@ def health_checks(parsed: List[Dict[str, Any]], kept: List[Dict[str, Any]]) -> L
     if not parsed:
         issues.append("No rows parsed.")
         return issues
-    # Duplicate composite keys in kept rows (date, orderItemType)
     seen = set()
     dups = 0
     for r in kept:
@@ -219,7 +196,6 @@ def health_checks(parsed: List[Dict[str, Any]], kept: List[Dict[str, Any]]) -> L
             seen.add(k)
     if dups:
         issues.append(f"{dups} duplicate (date, orderItemType) keys after windowing.")
-    # Nulls
     null_price = sum(1 for r in kept if r.get("orderItemTotalPriceWithoutVat") is None)
     if null_price:
         issues.append(f"{null_price} rows with NULL price.")
@@ -229,11 +205,6 @@ def health_checks(parsed: List[Dict[str, Any]], kept: List[Dict[str, Any]]) -> L
     return issues
 
 def process_pipeline(p: Dict[str, Any], bq_loc: str) -> Dict[str, Any]:
-    """
-    Process one pipeline: fetch CSV, parse, window/full, load, merge.
-    Required keys in p: id, csv_url, bq_table_id
-    Optional: load_mode (auto|full|window), window_days (int)
-    """
     csv_url = p["csv_url"]
     table_id = p["bq_table_id"]
     load_mode = (p.get("load_mode") or os.getenv("LOAD_MODE", "auto")).lower()
@@ -244,7 +215,6 @@ def process_pipeline(p: Dict[str, Any], bq_loc: str) -> Dict[str, Any]:
     csv_text = fetch_text_from_url(csv_url)
     raw_rows, headers, parse_errors = read_shoptet_csv(csv_text)
 
-    # Coerce & standardize to expected schema
     parsed_rows: List[Dict[str, Any]] = []
     for r in raw_rows:
         dt = parse_datetime(r.get("date"))
@@ -259,7 +229,6 @@ def process_pipeline(p: Dict[str, Any], bq_loc: str) -> Dict[str, Any]:
     bq_cli = bq_client()
     ensure_table(bq_cli, table_id, bq_loc)
 
-    # Resolve mode
     if load_mode not in {"auto", "full", "window"}:
         load_mode = "auto"
     if load_mode == "auto":
@@ -269,7 +238,6 @@ def process_pipeline(p: Dict[str, Any], bq_loc: str) -> Dict[str, Any]:
         effective_mode = load_mode
 
     kept_rows = parsed_rows if effective_mode == "full" else filter_by_window(parsed_rows, "date", window_days)
-    # Remove rows missing required fields after coercion
     kept_rows = [r for r in kept_rows if r["date"] is not None and r["orderItemType"] not in ("", None)]
 
     issues = health_checks(parsed_rows, kept_rows)
@@ -300,7 +268,6 @@ def run_ingest():
     start = time.time()
     bq_location = os.getenv("BQ_LOCATION", "EU")
 
-    # Single pipeline via env vars
     csv_url = os.getenv("CSV_URL")
     bq_table_id = os.getenv("BQ_TABLE_ID")
 
@@ -316,7 +283,6 @@ def run_ingest():
             "window_days": int(os.getenv("WINDOW_DAYS", "30")),
         }]
     else:
-        # Multi-pipeline requires CONFIG_URL (remote YAML)
         config_url = os.getenv("CONFIG_URL")
         if not config_url:
             return jsonify({
