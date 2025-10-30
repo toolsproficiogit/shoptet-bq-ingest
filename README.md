@@ -210,33 +210,36 @@ You deployed previously, and the service is running. Now you want to change pipe
 
 ### A) Find the CONFIG_URL
 ```bash
-SERVICE="<SERVICE_NAME>"     # e.g., shoptet-bq-multi
-REGION="<REGION>"            # e.g., europe-west1
-gcloud run services describe "$SERVICE" --region "$REGION" --format=json   | jq '.spec.template.spec.containers[0].env'
+SERVICE="<YOUR_SERVICE_NAME>"     #e.g. shoptet-bq-multi
+REGION="<REGION>"     #e.g. europe-west1
 
-# Pull just the URL
-CONFIG_URL=$(gcloud run services describe "$SERVICE" --region "$REGION"   --format="value(spec.template.spec.containers[0].env.list().filter(env, env.name='CONFIG_URL').0.value)")
+CONFIG_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format=json \
+  | jq -r '.spec.template.spec.containers[0].env[] | select(.name=="CONFIG_URL") | .value')
 echo "$CONFIG_URL"
+
 ```
 
-Extract bucket/object (optional):
+Extract bucket/object:
 ```bash
 BUCKET=$(echo "$CONFIG_URL" | sed -E 's#https?://storage.googleapis.com/([^/]+)/.*#\1#')
 OBJECT=$(echo "$CONFIG_URL" | sed -E 's#https?://storage.googleapis.com/[^/]+/(.*)#\1#')
 echo "Bucket=$BUCKET  Object=$OBJECT"
 ```
 
-### B) Download, edit visually, re‑upload
+### B) Download, edit visually
 ```bash
 mkdir -p config
 gsutil cp "gs://${BUCKET}/${OBJECT}" config/config.yaml
 
 cloudshell edit config/config.yaml    # add/remove pipelines, Save
+```
 
+### C) Reupload
+```bash
 gsutil cp config/config.yaml "gs://${BUCKET}/${OBJECT}"
 ```
 
-### C) Trigger and verify
+### D) Trigger and verify
 ```bash
 SERVICE_URL="<YOUR_SERVICE_URL>"
 ID_TOKEN=$(gcloud auth print-identity-token)
