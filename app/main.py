@@ -60,7 +60,7 @@ def decimal_comma_to_float(s: str) -> Optional[float]:
     except ValueError:
         return None
 
-def parse_datetime(s: Optional[str]) -> Optional[datetime]:
+def parse_datetime(s: Optional[Union[str, datetime]]) -> Optional[datetime]:
     """
     Parse 'YYYY-MM-DD HH:MM:SS' -> datetime (naive). If already datetime, pass through.
     """
@@ -107,7 +107,7 @@ def filter_by_window(rows: List[Dict[str, Any]], date_col: str, days: int) -> Li
     cutoff = datetime.now() - timedelta(days=days)
     out = []
     for r in rows:
-        v: Union[str, datetime, None] = r.get(date_col)
+        v = r.get(date_col)
         dt = v if isinstance(v, datetime) else parse_datetime(v)
         if dt and dt >= cutoff:
             out.append(r)
@@ -146,6 +146,25 @@ def _coerce_rows_for_bq(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(rr)
     return out
 
+def _dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    De-duplicate by composite key (date, orderItemType).
+    Keep the last non-null price seen for a given key.
+    """
+    seen: Dict[Tuple[Optional[datetime], str], Dict[str, Any]] = {}
+    for r in rows:
+        k = (r.get("date"), r.get("orderItemType") or "")
+        prev = seen.get(k)
+        if prev is None:
+            seen[k] = r
+        else:
+            # Prefer non-null price; otherwise, last wins
+            if prev.get("orderItemTotalPriceWithoutVat") is None and r.get("orderItemTotalPriceWithoutVat") is not None:
+                seen[k] = r
+            else:
+                seen[k] = r
+    return list(seen.values())
+
 def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_table: str, location: str) -> Optional[str]:
     if not rows:
         return None
@@ -158,8 +177,13 @@ def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_tabl
     ]
     bq.create_table(bigquery.Table(staging, schema=schema))
 
+    # De-duplicate before loading (defensive)
+    deduped = _dedupe_rows(rows)
+    if len(deduped) < len(rows):
+        log.info("De-duplicated %d -> %d rows before staging.", len(rows), len(deduped))
+
     # Convert datetime objects to strings for JSON load
-    json_rows = _coerce_rows_for_bq(rows)
+    json_rows = _coerce_rows_for_bq(deduped)
 
     job = bq.load_table_from_json(json_rows, staging, location=location)
     job.result()
@@ -167,9 +191,21 @@ def load_to_staging(bq: bigquery.Client, rows: List[Dict[str, Any]], target_tabl
     return staging
 
 def merge_staging(bq: bigquery.Client, staging: str, target: str, location: str) -> Tuple[int, int]:
+    """
+    Safe MERGE: collapse duplicates in the source (staging) so that
+    at most one row per (date, orderItemType) key reaches the MERGE.
+    Uses MAX(price) for determinism and to avoid NULL winning.
+    """
     query = f"""
     MERGE `{target}` T
-    USING `{staging}` S
+    USING (
+      SELECT
+        date,
+        orderItemType,
+        MAX(orderItemTotalPriceWithoutVat) AS orderItemTotalPriceWithoutVat
+      FROM `{staging}`
+      GROUP BY date, orderItemType
+    ) S
     ON T.date = S.date AND T.orderItemType = S.orderItemType
     WHEN MATCHED AND T.orderItemTotalPriceWithoutVat IS DISTINCT FROM S.orderItemTotalPriceWithoutVat THEN
       UPDATE SET orderItemTotalPriceWithoutVat = S.orderItemTotalPriceWithoutVat
@@ -195,7 +231,7 @@ def health_checks(parsed: List[Dict[str, Any]], kept: List[Dict[str, Any]]) -> L
         else:
             seen.add(k)
     if dups:
-        issues.append(f"{dups} duplicate (date, orderItemType) keys after windowing.")
+        issues.append(f"{dups} duplicate (date, orderItemType) keys after windowing (auto-dedup applied).")
     null_price = sum(1 for r in kept if r.get("orderItemTotalPriceWithoutVat") is None)
     if null_price:
         issues.append(f"{null_price} rows with NULL price.")
