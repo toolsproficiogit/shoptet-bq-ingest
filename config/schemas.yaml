@@ -1,0 +1,70 @@
+export_types:
+  basic:
+    - name: date
+      source: date
+      type: DATETIME
+      parse: datetime
+    - name: orderItemType
+      source: orderItemType
+      type: STRING
+      parse: string
+    - name: orderItemTotalPriceWithoutVat
+      source: orderItemTotalPriceWithoutVat
+      type: FLOAT
+      parse: decimal_comma
+
+  orders:
+    - name: date
+      source: date
+      type: DATETIME
+      parse: datetime
+    - name: orderItemTotalPriceWithoutVat
+      source: orderItemTotalPriceWithoutVat
+      type: FLOAT
+      parse: decimal_comma
+    - name: orderItemType
+      source: orderItemType
+      type: STRING
+      parse: string
+    - name: statusName
+      source: statusName
+      type: STRING
+      parse: string
+    - name: orderItemName
+      source: orderItemName
+      type: STRING
+      parse: string
+    - name: orderItemAmount
+      source: orderItemAmount
+      type: INT64
+      parse: int
+    - name: orderItemUnitPurchasePrice
+      source: orderItemUnitPurchasePrice
+      type: FLOAT
+      parse: decimal_comma
+
+  customers:
+    - name: date
+      source: date
+      type: DATETIME
+      parse: datetime
+    - name: email
+      source: email
+      type: STRING
+      parse: string
+    - name: statusName
+      source: statusName
+      type: STRING
+      parse: string
+    - name: code
+      source: code
+      type: STRING
+      parse: string
+    - name: totalPriceWithoutVat
+      source: totalPriceWithoutVat
+      type: FLOAT
+      parse: decimal_comma
+    - name: orderPurchasePrice
+      source: orderPurchasePrice
+      type: FLOAT
+      parse: decimal_comma

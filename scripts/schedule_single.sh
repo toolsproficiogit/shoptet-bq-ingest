@@ -1,36 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "$(dirname "$0")/helpers.sh"
-need gcloud
+cd "$(dirname "$0")/.."  # repo root
 
+# shellcheck disable=SC1091
+. scripts/common.sh
 
-read -rp "Project ID: " PROJECT_ID
-read -rp "Region (e.g. europe-central2): " REGION
-read -rp "Service name [shoptet-bq-ingest]: " SERVICE; SERVICE=${SERVICE:-shoptet-bq-ingest}
-read -rp "Job name [shoptet-bq-daily]: " JOB; JOB=${JOB:-shoptet-bq-daily}
-read -rp "Cron (e.g. '5 * * * *' hourly, '0 6 * * *' daily 06:00 UTC): " CRON
+echo "== Schedule Single-pipeline Service =="
 
+load_state || true
 
-URL=$(get_service_url "$SERVICE" "$REGION")
-SA=shoptet-bq-invoker
-SA_EMAIL="$SA@${PROJECT_ID}.iam.gserviceaccount.com"
+PROJECT_ID=${PROJECT_ID:-$(active_project)}
+PROJECT_ID=$(prompt_default "Project ID" "${PROJECT_ID}")
+REGION=$(prompt_default "Region" "${REGION:-europe-west1}")
+SERVICE=$(prompt_default "Service name" "${SERVICE:-shoptet-bq-ingest}")
+JOB=$(prompt_default "Scheduler job name" "daily-shoptet-bq")
+CRON=$(prompt_default "Cron (UTC)" "0 6 * * *")
 
+SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
+SA_NAME="shoptet-bq-invoker"
+SA="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
-gcloud iam service-accounts create "$SA" --display-name "Shoptet BQ Invoker" || true
+echo "Ensuring invoker service account ${SA} ..."
+gcloud iam service-accounts create "${SA_NAME}" --display-name "Shoptet BQ Invoker" 2>/dev/null || true
+gcloud run services add-iam-policy-binding "${SERVICE}" \
+  --region "${REGION}" \
+  --member "serviceAccount:${SA}" \
+  --role roles/run.invoker \
+  --condition=None
 
+URI="${SERVICE_URL}/run"
 
-gcloud run services add-iam-policy-binding "$SERVICE" \
---region "$REGION" \
---member "serviceAccount:${SA_EMAIL}" \
---role roles/run.invoker
+echo "Creating/updating Cloud Scheduler job ${JOB} ..."
+gcloud scheduler jobs delete "${JOB}" --location "${REGION}" -q >/dev/null 2>&1 || true
+gcloud scheduler jobs create http "${JOB}" \
+  --location "${REGION}" \
+  --schedule "${CRON}" \
+  --http-method GET \
+  --uri "${URI}" \
+  --oidc-service-account-email "${SA}"
 
-
-gcloud scheduler jobs create http "$JOB" \
---location "$REGION" \
---schedule "$CRON" \
---http-method GET \
---uri "${URL}/run" \
---oidc-service-account-email "$SA_EMAIL"
-
-
-echo "Created Scheduler job $JOB -> $CRON"
+echo
+echo "✅ Scheduled ${JOB}"
+echo "Calls: ${URI}"

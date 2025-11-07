@@ -30,15 +30,12 @@ In the top GCP navigation bar, click the **project selector** and choose the pro
 
 ## 📦 Create a BigQuery Dataset (required)
 
-You must create the dataset that your tables will live in. Remember the **dataset ID** and its **location** (e.g., `EU`).
+You must create the dataset that your tables will live in. By default, it will create dataset **shoptet_export** in the active project, in location **EU**.
 
 ```bash
-# 🔧 Replace placeholders before running
-PROJECT_ID="<YOUR_PROJECT_ID>"
-DATASET_ID="<YOUR_DATASET_ID>"     # choose yourself, e.g. shoptet_data
-BQ_LOCATION="<BQ_LOCATION>"         # choose a convenient location, e.g. EU
+PROJECT_ID="$(gcloud config get-value project)"
 
-bq --project_id="${PROJECT_ID}" --location="${BQ_LOCATION}" mk -d "${PROJECT_ID}:${DATASET_ID}"
+bq --project_id="$PROJECT_ID" --location=EU mk -d shoptet_export || true
 ```
 
 > Save/remember the `BQ_LOCATION` you pick here — you will reuse it later.
@@ -160,16 +157,96 @@ cloudshell edit config/config.yaml     # visual editor opens
 YAML example:
 ```yaml
 pipelines:
-  - id: orders
-    csv_url: https://example.com/orders.csv
-    bq_table_id: myproject.sales.orders
+  - id: advertiser1_orders
+    export_type: orders
+    csv_url: https://example.com/shoptet.csv
+    bq_table_id: <PROJECT>.shoptet_export.advertiser1_orders
     load_mode: auto
     window_days: 30
-  - id: shipping
-    csv_url: https://example.com/shipping.csv
-    bq_table_id: myproject.sales.shipping
-    load_mode: window
-    window_days: 14
+
+  - id: advertiser2_customers
+    export_type: customers  
+    csv_url: https://example.com/shoptet.csv
+    bq_table_id: <PROJECT>.shoptet_export.advertiser2_customers
+    load_mode: auto
+    window_days: 30
+```
+
+### 3) Schema library (define columns and formats in the CSV)
+
+You can edit or add schemas that the service will expect from incoming CSVs. You can control the processing of each CSV pipeline in the export_type field. There are 3 premade export configurations, **If your export matches one of these, you do not need to create new ones.**
+
+```yaml
+export_types:
+  basic:
+    - name: date
+      source: date
+      type: DATETIME
+      parse: datetime
+    - name: orderItemType
+      source: orderItemType
+      type: STRING
+      parse: string
+    - name: orderItemTotalPriceWithoutVat
+      source: orderItemTotalPriceWithoutVat
+      type: FLOAT
+      parse: decimal_comma
+
+  orders:
+    - name: date
+      source: date
+      type: DATETIME
+      parse: datetime
+    - name: orderItemTotalPriceWithoutVat
+      source: orderItemTotalPriceWithoutVat
+      type: FLOAT
+      parse: decimal_comma
+    - name: orderItemType
+      source: orderItemType
+      type: STRING
+      parse: string
+    - name: statusName
+      source: statusName
+      type: STRING
+      parse: string
+    - name: orderItemName
+      source: orderItemName
+      type: STRING
+      parse: string
+    - name: orderItemAmount
+      source: orderItemAmount
+      type: INT64
+      parse: int
+    - name: orderItemUnitPurchasePrice
+      source: orderItemUnitPurchasePrice
+      type: FLOAT
+      parse: decimal_comma
+
+  customers:
+    - name: date
+      source: date
+      type: DATETIME
+      parse: datetime
+    - name: email
+      source: email
+      type: STRING
+      parse: string
+    - name: statusName
+      source: statusName
+      type: STRING
+      parse: string
+    - name: code
+      source: code
+      type: STRING
+      parse: string
+    - name: totalPriceWithoutVat
+      source: totalPriceWithoutVat
+      type: FLOAT
+      parse: decimal_comma
+    - name: orderPurchasePrice
+      source: orderPurchasePrice
+      type: FLOAT
+      parse: decimal_comma
 ```
 
 ### 2) Deploy (uploads YAML to GCS, sets CONFIG_URL, deploys service)
@@ -177,105 +254,89 @@ pipelines:
 chmod +x scripts/*.sh
 ./scripts/deploy_multi.sh
 ```
-The script will prompt for:
-- Project, Region, Service name
-- **Local YAML path** (e.g., `config/config.yaml`)
-- **GCS bucket** (will be created if missing)
-- **Object name** (e.g., `shoptet_config.yaml`)
+The script will choose defaults for the following options. to confirm default, press **ENTER**, otherwise input your own values:
+
+| Setting | Default |
+|--------|----------------|
+| **Region** | europe-west1 |
+| **Service name** | shoptet-bq-multi |
+| **Pipelines file** | config/cinfig.yaml |
+| **Schemas file** | config/schemas.yaml |
+| **BigQuery location** | EU|
+| **GCS bucket** | Shoptet-config-<PROJECT_ID> |
+| **Scheduler job name** | daily-shoptet-bq |
+| **Mode** | auto (full history on first run, then only last <Window days>) |
+| **Window days** | 30 |
 
 It will:
-1) Upload the YAML to `gs://<bucket>/<object>`  
-2) Deploy Cloud Run with `MULTI_MODE=true` and `CONFIG_URL=https://storage.googleapis.com/<bucket>/<object>`  
-3) Print the service URL and a test `curl`
+1) Validate both YAMLs
+2) Warn if multiple pipelines target the same table (must confirm "Y/N"
+3) Upload both configs to Cloud Storage
+4) Build and deploy Cloud Run service
+5) Grant permissions
+6) Print `Service URL` and save it to deploy_state
 
-### 3) Trigger test (all pipelines)
+### 3) Manually run at once (all pipelines)
+
 ```bash
-SERVICE_URL="<YOUR_SERVICE_URL>"
-ID_TOKEN=$(gcloud auth print-identity-token)
-curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
+./scripts/trigger.sh
 ```
+### 4) Schedule runs with default (daily at 6 AM) (all pipelines)
 
-Run a **single pipeline** by ID:
 ```bash
-curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run?pipeline=<PIPELINE_ID>" | jq
+./scripts/schedule_multi.sh
 ```
-
-You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top.
 
 ---
 
-## Add/Remove Pipelines on an already-deployed service
+## Manage pipelines and schemas on deployed service
 
 You deployed previously, and the service is running. Now you want to change pipelines. Start a **new Cloud Shell session** (described at the start of the README). 
 
-### A) Find the CONFIG_URL
+### A) Edit pipeline configs
 ```bash
-SERVICE="<YOUR_SERVICE_NAME>"     #e.g. shoptet-bq-multi
-REGION="<REGION>"     #e.g. europe-west1
+SERVICE="shoptet-bq-multi"; REGION="europe-west1"
 
 CONFIG_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format=json \
   | jq -r '.spec.template.spec.containers[0].env[] | select(.name=="CONFIG_URL") | .value')
-echo "$CONFIG_URL"
-
-```
-
-Extract bucket/object:
-```bash
 BUCKET=$(echo "$CONFIG_URL" | sed -E 's#https?://storage.googleapis.com/([^/]+)/.*#\1#')
 OBJECT=$(echo "$CONFIG_URL" | sed -E 's#https?://storage.googleapis.com/[^/]+/(.*)#\1#')
-echo "Bucket=$BUCKET  Object=$OBJECT"
+
+mkdir -p config && gsutil cp "gs://${BUCKET}/${OBJECT}" config/config.yaml
+cloudshell edit config/config.yaml
 ```
 
-### B) Download, edit visually
-```bash
-mkdir -p config
-gsutil cp "gs://${BUCKET}/${OBJECT}" config/config.yaml
-
-cloudshell edit config/config.yaml    # add/remove pipelines, Save
-```
-
-### C) Reupload
+Edit the config file, add or remove pipelines, save, and:
 ```bash
 gsutil cp config/config.yaml "gs://${BUCKET}/${OBJECT}"
 ```
 
-### D) Trigger and verify
+### B) Edit schemas
 ```bash
-SERVICE_URL="<YOUR_SERVICE_URL>"
+SERVICE="shoptet-bq-multi"; REGION="europe-west1"
+
+SCHEMA_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format=json \
+  | jq -r '.spec.template.spec.containers[0].env[] | select(.name=="SCHEMA_URL") | .value')
+SBUCKET=$(echo "$SCHEMA_URL" | sed -E 's#https?://storage.googleapis.com/([^/]+)/.*#\1#')
+SOBJECT=$(echo "$SCHEMA_URL" | sed -E 's#https?://storage.googleapis.com/[^/]+/(.*)#\1#')
+
+mkdir -p config && gsutil cp "gs://${SBUCKET}/${SOBJECT}" config/schemas.yaml
+cloudshell edit config/schemas.yaml
+```
+
+Edit the config file, add or remove pipelines, save, and:
+```bash
+gsutil cp config/schemas.yaml "gs://${SBUCKET}/${SOBJECT}"
+```
+
+### Retrigger run manually
+```bash
+SERVICE_URL=$(gcloud run services describe shoptet-bq-multi --region europe-west1 --format='value(status.url)')
 ID_TOKEN=$(gcloud auth print-identity-token)
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
 ```
 
-> Scheduler jobs do **not** need changes. Next scheduled run uses the new YAML.
-
----
-
-## ⏰ Scheduling (Automation)
-
-Here you can select refresh frequency with which the BigQuery table will be updated. 
-
-### 🔹 Single-pipeline schedule
-
-```bash
-cd scripts
-./schedule_single.sh
-```
-
-Prompts you for:
-- Project ID & Region
-- Job name (e.g. `daily-shoptet-bq`)
-- Cron schedule (see below)
-
-### 🔹 Multi-pipeline schedule
-
-```bash
-cd scripts
-./schedule_multi.sh
-```
-
-You can schedule **all pipelines** or a single one by ID.
-
-### ⏱ About cron expressions
+### ⏱ About cron expressions (set up flexible schedules)
 
 You can find more about Cron expressions [https://docs.cloud.google.com/scheduler/docs/configuring/cron-job-schedules](here).
 
@@ -294,21 +355,19 @@ Examples of useful, ready-to-use Cron expressions for this deployment:
 ## Teardown (clean-up)
 
 ```bash
-cd scripts
-./teardown.sh
-
-gcloud run services list --region <REGION>
-gcloud scheduler jobs list --location <REGION>
+REGION="europe-west1"
+gcloud run services delete shoptet-bq-multi --region "$REGION" -q
+gcloud scheduler jobs delete daily-shoptet-bq --location "$REGION" -q
 ```
 
 ---
 
 ## 📊 Verify BigQuery Data
 
-After a successful run, check your dataset:
+After a successful run, check your tables in BigQuery:
 
 ```sql
-SELECT * FROM `<PROJECT>.<DATASET>.<TABLE>`
+SELECT * FROM `<PROJECT>.shoptet_export.<TABLE>`
 ORDER BY date DESC
 LIMIT 20;
 ```

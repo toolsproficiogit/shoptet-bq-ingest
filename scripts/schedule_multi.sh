@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")/.."  # repo root
 
-prompt() { read -rp "$1: " REPLY && echo "$REPLY"; }
+# shellcheck disable=SC1091
+. scripts/common.sh
 
-PROJECT_ID=${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}
-if [[ -z "${PROJECT_ID}" ]]; then PROJECT_ID=$(prompt "Project ID"); fi
-REGION=${REGION:-$(prompt "Region (e.g. europe-west1)")}
-SERVICE=${SERVICE:-$(prompt "Service name (e.g. shoptet-bq-multi)")}
-JOB=${JOB:-$(prompt "Scheduler job name (e.g. shoptet-bq-daily)")}
-CRON=${CRON:-$(prompt "Cron (UTC), e.g. '0 6 * * *' for 06:00 daily")}
-PIPELINE_ID=${PIPELINE_ID:-$(prompt "Optional pipeline id (leave blank for ALL)")}
+echo "== Schedule Multi-pipeline Service =="
+
+load_state || true
+
+PROJECT_ID=${PROJECT_ID:-$(active_project)}
+PROJECT_ID=$(prompt_default "Project ID" "${PROJECT_ID}")
+REGION=$(prompt_default "Region" "${REGION:-europe-west1}")
+SERVICE=$(prompt_default "Service name" "${SERVICE:-shoptet-bq-multi}")
+JOB=$(prompt_default "Scheduler job name" "daily-shoptet-bq")
+CRON=$(prompt_default "Cron (UTC)" "0 6 * * *")
+PIPELINE_ID=$(prompt_default "Optional pipeline id (leave blank for ALL)" "")
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
-
 SA_NAME="shoptet-bq-invoker"
 SA="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
-echo "Creating/ensuring invoker service account ${SA} ..."
+echo "Ensuring invoker service account ${SA} ..."
 gcloud iam service-accounts create "${SA_NAME}" --display-name "Shoptet BQ Invoker" 2>/dev/null || true
 gcloud run services add-iam-policy-binding "${SERVICE}" \
   --region "${REGION}" \
@@ -38,4 +43,6 @@ gcloud scheduler jobs create http "${JOB}" \
   --uri "${URI}" \
   --oidc-service-account-email "${SA}"
 
-echo "Done. Job '${JOB}' will call: ${URI}"
+echo
+echo "✅ Scheduled ${JOB}"
+echo "Calls: ${URI}"
