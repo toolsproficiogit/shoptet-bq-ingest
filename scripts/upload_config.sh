@@ -12,11 +12,11 @@ load_state || true
 PROJECT_ID=${PROJECT_ID:-$(active_project)}
 PROJECT_ID=$(prompt_default "Project ID" "${PROJECT_ID}")
 REGION=$(prompt_default "Region" "${REGION:-europe-west1}")
-SERVICE=$(prompt_default "Service name" "${SERVICE:-shoptet-bq-multi}")
+SERVICE=$(prompt_default "Service name" "${SERVICE:-csv-bq-multi}")
 LOCAL_YAML=$(prompt_default "Path to local YAML" "config/config.yaml")
-DEFAULT_BUCKET="shoptet-config-${PROJECT_ID}"
+DEFAULT_BUCKET="csv-config-${PROJECT_ID}"
 BUCKET=$(prompt_default "GCS bucket name" "${BUCKET:-$DEFAULT_BUCKET}")
-OBJECT=$(prompt_default "Object name" "${OBJECT:-shoptet_config.yaml}")
+OBJECT=$(prompt_default "Object name" "${OBJECT:-csv_config.yaml}")
 
 if [[ ! -r "$LOCAL_YAML" ]]; then echo "❌ Cannot read YAML: $LOCAL_YAML"; exit 1; fi
 sed -i 's/\r$//' "$LOCAL_YAML" || true

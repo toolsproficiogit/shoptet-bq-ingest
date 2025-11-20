@@ -42,6 +42,10 @@ export_types:
       source: orderItemUnitPurchasePrice
       type: FLOAT
       parse: decimal_comma
+    - name: currencyCode
+      source: currencyCode
+      type: STRING
+      parse: string
 
   customers:
     - name: date
@@ -68,3 +72,7 @@ export_types:
       source: orderPurchasePrice
       type: FLOAT
       parse: decimal_comma
+    - name: currencyCode
+      source: currencyCode
+      type: STRING
+      parse: string

@@ -9,7 +9,7 @@ load_state || true
 
 PROJECT_ID=${PROJECT_ID:-$(active_project)}
 REGION=$(prompt_default "Region" "${REGION:-europe-west1}")
-SERVICE=$(prompt_default "Service name" "${SERVICE:-${SERVICE:-shoptet-bq-multi}}")
+SERVICE=$(prompt_default "Service name" "${SERVICE:-${SERVICE:-csv-bq-multi}}")
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
 ID_TOKEN=$(gcloud auth print-identity-token)

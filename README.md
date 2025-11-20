@@ -1,9 +1,11 @@
-# 🌐 Shoptet → BigQuery Cloud Run Ingest
+# 🌐 CSV → BigQuery Cloud Run Ingest
 
-This solution runs entirely in **Google Cloud Platform (GCP)** — no local installation is needed. It should run fast and with low costs, and offers good scalability. 
-It downloads your **Shoptet CSV exports** and loads them into **BigQuery**, automatically and securely.
+This solution runs entirely in **Google Cloud Platform (GCP)** — no local installation is needed. It should run fast and with low costs, and offer good scalability and flexibility. 
+It downloads your **CSV exports** from a remote link (such as Shoptet CSVs) and loads them into **BigQuery**, automatically and securely.
 
-> **Important:** This service **does not create BigQuery datasets for you**. You must create the **dataset(s)** ahead of time and choose/remember their **location** (e.g., `EU`). The service will create **tables** if they are missing.
+Everything runs **within your own GCP project**, there is no external data processing - this solution only provides the codebase to set up your own service.
+
+> **Important:** this tool was developed to be compatible with **Shoptet CSVs**. However, it should work with any CSV as long as its schema is properly configured.
 
 ---
 
@@ -30,15 +32,15 @@ In the top GCP navigation bar, click the **project selector** and choose the pro
 
 ## 📦 Create a BigQuery Dataset (required)
 
-You must create the dataset that your tables will live in. By default, it will create dataset **shoptet_export** in the active project, in location **EU**.
+You must create the dataset that your tables will live in. By default, it will create dataset **csv_export** in the active project, in location **EU**. If you want to change the dataset name and/or location, switch these fields in the command.
 
 ```bash
 PROJECT_ID="$(gcloud config get-value project)"
 
-bq --project_id="$PROJECT_ID" --location=EU mk -d shoptet_export || true
+bq --project_id="$PROJECT_ID" --location=EU mk -d csv_export || true
 ```
 
-> Save/remember the `BQ_LOCATION` you pick here — you will reuse it later.
+> **For a more advanced implementation, you can change the name and location of the dataset. You can even create multiple datasets by running the command repeatedly. However, make sure to remember the names and the corresponding locations as they will be used later.*
 
 ---
 
@@ -59,7 +61,7 @@ Before starting, ensure your account has the roles below. Without them, deployme
 | `roles/serviceusage.serviceUsageAdmin` | Enable required APIs |
 | `roles/storage.admin` | Create buckets & upload YAML (remote config) |
 
-### ✅ Grant the roles (admin or owner runs this)
+### ✅ Grant the roles (run yourself you have a project owner/admin role, otherwise contact project owner/admin)
 
 ```bash
 # Clone repo and make scripts executable
@@ -67,7 +69,7 @@ git clone https://github.com/toolsproficiogit/shoptet-bq-ingest.git
 cd shoptet-bq-ingest
 chmod +x scripts/*.sh
 
-# Grant roles to a specific user (run as Project Owner/Admin)
+# Grant roles to a specific user (change project ID and email as needed)
 PROJECT_ID="<YOUR_PROJECT_ID>"
 USER_EMAIL="<YOUR_EMAIL>"
 PROJECT_ID="$PROJECT_ID" USER_EMAIL="$USER_EMAIL" ./scripts/grant_permissions.sh
@@ -86,64 +88,9 @@ Ask a **Project Owner** or **Organization Admin** to grant roles if any are miss
 
 ---
 
-## 🚀 Quick Start: Single Pipeline
-
-This mode loads exactly one CSV → one BigQuery table. Use this if you have just a single export for a single project. If you plan to ingest multiple CSVs in a single project, use the Multi-Pipeline setup instructions below.
-
-### ⚙️ Deploy via Cloud Shell
-
-Open Cloud Shell and run:
-
-```bash
-git clone https://github.com/toolsproficiogit/shoptet-bq-ingest.git
-cd shoptet-bq-ingest
-chmod +x scripts/*.sh
-./scripts/deploy_single.sh
-```
-
-During the prompt-based setup, you’ll provide:
-
-| Prompt | What to enter |
-|--------|----------------|
-| **Project ID** | Your GCP project ID (e.g., `my-gcp-project`) |
-| **Region** | Cloud Run region (e.g., `europe-west1`) |
-| **Service name** | The Cloud Run service name (default `shoptet-bq-ingest`). You can deploy multiple services with different names if needed. |
-| **CSV URL** | The direct Shoptet CSV export link. |
-| **BigQuery table (project.dataset.table)** | Use your **existing dataset**. Example: `my-gcp-project.shoptet_data.orders` |
-| **Window days** | Days to upsert for incremental loads; default `30`. This reduces the number of processed rows for each scheduled run. |
-| **Load mode** | `auto` (default; full if table empty, then window), `full` (always all rows), or `window` (always last N days). |
-| **BQ Location** | Must match the dataset’s location (e.g., `EU`). |
-
-> 🧠 First run loads **full history** automatically if the table is empty (when `LOAD_MODE=auto`). After that, only the last 30 days will be appended/updated.
-
-After the service is deployed, you can **trigger it manually**, if you want to test the connection and populate data immediately before setting up schedule. Use **this command**:
-
-```bash
-SERVICE_URL="<YOUR_SERVICE_URL>"
-ID_TOKEN=$(gcloud auth print-identity-token)
-curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
-```
-
-You will see the **Service URL** printed in the Cloud Shell. Alternatively, you can check it in Cloud Console, if you navigate to Cloud Run > Services > load-csv-to-bigquery (your chosen service name) > URL is displayed at the top.
-
-Response example:
-```json
-{
-  "status": "ok",
-  "message": "Ingest complete",
-  "parsed_rows": 400,
-  "kept_rows": 398,
-  "mode": "auto"
-}
-```
-
-You can now verify BigQuery by running the command at the end of this README, or by simply looking in the UI.
-
----
-
 ## Quick Start — Multi‑Pipeline
 
-A single service that runs multiple pipelines (CSV links and target tables) defined in a remote **YAML** file. You define settings individually for each pipeline.
+A single service that runs multiple pipelines (CSV links and target tables) defined in a remote **YAML** file, using a custom schema config. You define settings individually for each pipeline.
 
 ### 1) Prepare YAML locally
 ```bash
@@ -157,120 +104,54 @@ cloudshell edit config/config.yaml     # visual editor opens
 YAML example:
 ```yaml
 pipelines:
-  - id: advertiser1_orders
+  - id: client1_orders
     export_type: orders
     csv_url: https://example.com/shoptet.csv
-    bq_table_id: <PROJECT>.shoptet_export.advertiser1_orders
+    bq_table_id: <PROJECT>.<DATASET>.<TABLE>
     load_mode: auto
     window_days: 30
 
-  - id: advertiser2_customers
+  - id: client1_customers
     export_type: customers  
     csv_url: https://example.com/shoptet.csv
-    bq_table_id: <PROJECT>.shoptet_export.advertiser2_customers
+    bq_table_id: <PROJECT>.<DATASET>.<TABLE>
     load_mode: auto
     window_days: 30
 ```
+
+You can add/remove and edit pipelines, but make sure to keep **correct formatting** (consistent indentation, spaces, number of enters)
+
+Make sure the datasets for your tables (remember names from the first step)!
 
 ### 3) Schema library (define columns and formats in the CSV)
 
-You can edit or add schemas that the service will expect from incoming CSVs. You can control the processing of each CSV pipeline in the export_type field. There are 3 premade export configurations, **If your export matches one of these, you do not need to create new ones.**
+You can edit or add schemas that the service will expect from incoming CSVs. You can control the processing of each CSV pipeline in the export_type field. There are 3 premade CSV configurations (based on custom Shoptet exports), **If your export matches one of these, you do not need to create new ones.**
 
-```yaml
-export_types:
-  basic:
-    - name: date
-      source: date
-      type: DATETIME
-      parse: datetime
-    - name: orderItemType
-      source: orderItemType
-      type: STRING
-      parse: string
-    - name: orderItemTotalPriceWithoutVat
-      source: orderItemTotalPriceWithoutVat
-      type: FLOAT
-      parse: decimal_comma
+You can inspect the default schemas in the `config/schemas.yaml` file.
 
-  orders:
-    - name: date
-      source: date
-      type: DATETIME
-      parse: datetime
-    - name: orderItemTotalPriceWithoutVat
-      source: orderItemTotalPriceWithoutVat
-      type: FLOAT
-      parse: decimal_comma
-    - name: orderItemType
-      source: orderItemType
-      type: STRING
-      parse: string
-    - name: statusName
-      source: statusName
-      type: STRING
-      parse: string
-    - name: orderItemName
-      source: orderItemName
-      type: STRING
-      parse: string
-    - name: orderItemAmount
-      source: orderItemAmount
-      type: INT64
-      parse: int
-    - name: orderItemUnitPurchasePrice
-      source: orderItemUnitPurchasePrice
-      type: FLOAT
-      parse: decimal_comma
-
-  customers:
-    - name: date
-      source: date
-      type: DATETIME
-      parse: datetime
-    - name: email
-      source: email
-      type: STRING
-      parse: string
-    - name: statusName
-      source: statusName
-      type: STRING
-      parse: string
-    - name: code
-      source: code
-      type: STRING
-      parse: string
-    - name: totalPriceWithoutVat
-      source: totalPriceWithoutVat
-      type: FLOAT
-      parse: decimal_comma
-    - name: orderPurchasePrice
-      source: orderPurchasePrice
-      type: FLOAT
-      parse: decimal_comma
-```
+When editing these, make sure the column names and data types **exactly match** your CSVs (including hidden characters, trailing spaces etc.), otherwise the columns will be unprocessed. The **parse** refers to the data type as it appears in the CSV, The **type** refers to the data type this field will be saved as to BigQuery.
 
 ### 2) Deploy (uploads YAML to GCS, sets CONFIG_URL, deploys service)
 ```bash
 chmod +x scripts/*.sh
 ./scripts/deploy_multi.sh
 ```
-The script will choose defaults for the following options. to confirm default, press **ENTER**, otherwise input your own values:
+The script will choose defaults for the following options. To confirm default, press **ENTER**, otherwise input your own values (only if you know what you are doing):
 
 | Setting | Default |
 |--------|----------------|
 | **Region** | europe-west1 |
-| **Service name** | shoptet-bq-multi |
-| **Pipelines file** | config/cinfig.yaml |
+| **Service name** | csv-bq-multi |
+| **Pipelines file** | config/config.yaml |
 | **Schemas file** | config/schemas.yaml |
 | **BigQuery location** | EU|
-| **GCS bucket** | Shoptet-config-<PROJECT_ID> |
-| **Scheduler job name** | daily-shoptet-bq |
+| **GCS bucket** | csv-config-<PROJECT_ID> |
 | **Mode** | auto (full history on first run, then only last <Window days>) |
 | **Window days** | 30 |
 
 It will:
 1) Validate both YAMLs
-2) Warn if multiple pipelines target the same table (must confirm "Y/N"
+2) Warn if multiple pipelines target the same table (must confirm "Y/N")
 3) Upload both configs to Cloud Storage
 4) Build and deploy Cloud Run service
 5) Grant permissions
@@ -287,15 +168,25 @@ It will:
 ./scripts/schedule_multi.sh
 ```
 
+The script will choose defaults for the following options. To confirm default, press **ENTER**, otherwise input your own values (at your own risk, if you know what you are doing):
+
+| Setting | Default |
+|--------|----------------|
+| **Region** | europe-west1 (needs to match service location) |
+| **Service name** | csv-bq-multi (needs to match created service) |
+| **Scheduler job name** | daily-csv-bq |
+| **CRON** | 0 6 * * * (every day at 6 AM, change for different frequency - see more info at the end) |
+| **Pipeline ID** | all pipelines (input IDs to only create for some pipelines) |
+
 ---
 
 ## Manage pipelines and schemas on deployed service
 
-You deployed previously, and the service is running. Now you want to change pipelines. Start a **new Cloud Shell session** (described at the start of the README). 
+You deployed previously, and the service is running. Now you want to change pipelines on the fly. That's very easy, and doesn't require any redeployment. Start a **new Cloud Shell session** (described at the start of the README). 
 
 ### A) Edit pipeline configs
 ```bash
-SERVICE="shoptet-bq-multi"; REGION="europe-west1"
+SERVICE="csv-bq-multi"; REGION="europe-west1"
 
 CONFIG_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format=json \
   | jq -r '.spec.template.spec.containers[0].env[] | select(.name=="CONFIG_URL") | .value')
@@ -313,7 +204,7 @@ gsutil cp config/config.yaml "gs://${BUCKET}/${OBJECT}"
 
 ### B) Edit schemas
 ```bash
-SERVICE="shoptet-bq-multi"; REGION="europe-west1"
+SERVICE="csv-bq-multi"; REGION="europe-west1"
 
 SCHEMA_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format=json \
   | jq -r '.spec.template.spec.containers[0].env[] | select(.name=="SCHEMA_URL") | .value')
@@ -324,14 +215,14 @@ mkdir -p config && gsutil cp "gs://${SBUCKET}/${SOBJECT}" config/schemas.yaml
 cloudshell edit config/schemas.yaml
 ```
 
-Edit the config file, add or remove pipelines, save, and:
+Edit the schema file, add or remove export types/fields, save, and:
 ```bash
 gsutil cp config/schemas.yaml "gs://${SBUCKET}/${SOBJECT}"
 ```
 
 ### Retrigger run manually
 ```bash
-SERVICE_URL=$(gcloud run services describe shoptet-bq-multi --region europe-west1 --format='value(status.url)')
+SERVICE_URL=$(gcloud run services describe csv-bq-multi --region europe-west1 --format='value(status.url)')
 ID_TOKEN=$(gcloud auth print-identity-token)
 curl -s -H "Authorization: Bearer $ID_TOKEN" "${SERVICE_URL}/run" | jq
 ```
@@ -352,12 +243,34 @@ Examples of useful, ready-to-use Cron expressions for this deployment:
 
 ---
 
+## Updating a deployed service to allow unknown columns
+
+If your CSV exports include unexpected or renamed fields and you don't want the pipeline to stop,  
+you can enable a safe fallback mode so the service skips unrecognized columns. **Only enable this if you know what you are doing!** Otherwise it is preferable to edit the schema file to include the missing columns. 
+
+### One-command setup (copy-paste)
+
+Run this in Cloud Shell while in the repo directory:
+```bash
+./scripts/update_env_allow_unknown.sh
+```
+
+You can verify with:
+```bash
+gcloud run services describe csv-bq-multi \
+  --region europe-west1 \
+  --format="table(spec.template.spec.containers[].env[].name,spec.template.spec.containers[].env[].value)"
+```
+
+Once this is set, all scheduled and manual runs **automatically skip unknown columns**
+(e.g., new or extra headers in the CSV).
+
 ## Teardown (clean-up)
 
 ```bash
 REGION="europe-west1"
-gcloud run services delete shoptet-bq-multi --region "$REGION" -q
-gcloud scheduler jobs delete daily-shoptet-bq --location "$REGION" -q
+gcloud run services delete csv-bq-multi --region "$REGION" -q
+gcloud scheduler jobs delete daily-csv-bq --location "$REGION" -q
 ```
 
 ---
@@ -367,7 +280,7 @@ gcloud scheduler jobs delete daily-shoptet-bq --location "$REGION" -q
 After a successful run, check your tables in BigQuery:
 
 ```sql
-SELECT * FROM `<PROJECT>.shoptet_export.<TABLE>`
+SELECT * FROM `<PROJECT>.csv_export.<TABLE>`
 ORDER BY date DESC
 LIMIT 20;
 ```

@@ -12,17 +12,17 @@ load_state || true
 PROJECT_ID=${PROJECT_ID:-$(active_project)}
 PROJECT_ID=$(prompt_default "Project ID" "${PROJECT_ID}")
 REGION=$(prompt_default "Region" "${REGION:-europe-west1}")
-SERVICE=$(prompt_default "Service name" "${SERVICE:-shoptet-bq-multi}")
-JOB=$(prompt_default "Scheduler job name" "daily-shoptet-bq")
+SERVICE=$(prompt_default "Service name" "${SERVICE:-csv-bq-multi}")
+JOB=$(prompt_default "Scheduler job name" "daily-csv-bq")
 CRON=$(prompt_default "Cron (UTC)" "0 6 * * *")
 PIPELINE_ID=$(prompt_default "Optional pipeline id (leave blank for ALL)" "")
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
-SA_NAME="shoptet-bq-invoker"
+SA_NAME="csv-bq-invoker"
 SA="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 echo "Ensuring invoker service account ${SA} ..."
-gcloud iam service-accounts create "${SA_NAME}" --display-name "Shoptet BQ Invoker" 2>/dev/null || true
+gcloud iam service-accounts create "${SA_NAME}" --display-name "CSV BQ Invoker" 2>/dev/null || true
 gcloud run services add-iam-policy-binding "${SERVICE}" \
   --region "${REGION}" \
   --member "serviceAccount:${SA}" \

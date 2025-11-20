@@ -5,54 +5,61 @@ cd "$(dirname "$0")/.."  # ensure repo root
 # shellcheck disable=SC1091
 . scripts/common.sh
 
-echo "== Shoptet → BigQuery: Multi-pipeline (Remote YAML) Deploy =="
+echo "== CSV → BigQuery: Multi-pipeline (Remote YAML) Deploy =="
 
 PROJECT_ID=${PROJECT_ID:-$(active_project)}
 PROJECT_ID=$(prompt_default "Project ID" "${PROJECT_ID}")
 REGION=$(prompt_default "Region" "europe-west1")
-SERVICE=$(prompt_default "Service name" "shoptet-bq-multi")
+SERVICE=$(prompt_default "Service name" "csv-bq-multi")
 LOCAL_YAML=$(prompt_default "Local YAML path" "config/config.yaml")
 LOCAL_SCHEMAS=$(prompt_default "Schema library path" "config/schemas.yaml")
 BQ_LOCATION=$(prompt_default "BigQuery location" "EU")
 
 # Config bucket defaults to unique per project
-DEFAULT_BUCKET="shoptet-config-${PROJECT_ID}"
+DEFAULT_BUCKET="csv-config-${PROJECT_ID}"
 BUCKET=$(prompt_default "GCS bucket for config" "$DEFAULT_BUCKET")
-OBJECT_CFG=$(prompt_default "Pipelines object name" "shoptet_config.yaml")
+OBJECT_CFG=$(prompt_default "Pipelines object name" "csv_config.yaml")
 OBJECT_SCH=$(prompt_default "Schemas object name" "schemas.yaml")
 
 REPO=${REPO:-containers}
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:v1"
 
 echo "Enabling required APIs (idempotent)..."
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com iam.googleapis.com
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com iam.googleapis.com >/dev/null
 
 echo "Ensuring Artifact Registry repo '${REPO}' exists in ${REGION}..."
-gcloud artifacts repositories describe "${REPO}" --location "${REGION}" >/dev/null 2>&1 || \
-gcloud artifacts repositories create "${REPO}" --repository-format=docker --location "${REGION}" --description="Containers"
+if ! gcloud artifacts repositories describe "${REPO}" --location "${REGION}" >/dev/null 2>&1; then
+  gcloud artifacts repositories create "${REPO}" --repository-format=docker --location "${REGION}" --description="Containers"
+fi
 
-# Preflight YAML
+# Preflight YAML readability + normalize newlines
 for f in "$LOCAL_YAML" "$LOCAL_SCHEMAS"; do
   if [[ ! -r "$f" ]]; then echo "❌ Cannot read file: $f"; exit 1; fi
   sed -i 's/\r$//' "$f" || true
 done
 
+# Make sure inline Python sees these vars
+export LOCAL_YAML
+export LOCAL_SCHEMAS
+
 # Validate pipelines YAML
 python3 - <<'PY'
 import yaml,os,sys
 p=os.environ.get("LOCAL_YAML")
-d=yaml.safe_load(open(p,"rb"))
+with open(p,"rb") as f:
+    d=yaml.safe_load(f)
 assert isinstance(d,dict), "Top-level must be a mapping"
 pls=d.get("pipelines")
 assert isinstance(pls,list) and len(pls)>0, "'pipelines' must be a non-empty list"
-print("✅ Pipelines YAML OK:", len(pls), "pipelines")
+print("✅ Pipelines YAML OK:", len(pls), "pipeline(s)")
 PY
 
 # Validate schema library YAML
 python3 - <<'PY'
 import yaml,os,sys
 p=os.environ.get("LOCAL_SCHEMAS")
-d=yaml.safe_load(open(p,"rb"))
+with open(p,"rb") as f:
+    d=yaml.safe_load(f)
 ets=d.get("export_types",{})
 assert isinstance(ets,dict) and len(ets)>=1, "'export_types' must be a mapping with at least one schema"
 for name,fields in ets.items():
@@ -60,16 +67,16 @@ for name,fields in ets.items():
 print("✅ Schema library OK:", ", ".join(ets.keys()))
 PY
 
-# Duplicate table detection
+# Duplicate table detection with confirmation
 echo "Checking for duplicate BigQuery table targets..."
 DUPES=$(python3 - <<'PY'
 import yaml,os,collections
 p=os.environ.get("LOCAL_YAML")
-d=yaml.safe_load(open(p,"rb"))
+with open(p,"rb") as f:
+    d=yaml.safe_load(f)
 cts=collections.Counter(p.get("bq_table_id") for p in d.get("pipelines",[]) if p.get("bq_table_id"))
 dupes=[t for t,c in cts.items() if c>1]
-if dupes:
-    print(",".join(dupes))
+print(",".join(dupes))
 PY
 )
 if [[ -n "$DUPES" ]]; then
@@ -105,17 +112,17 @@ gcloud run deploy "${SERVICE}" \
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
 
-# Runtime SA read on bucket
+# Determine runtime service account (explicit or default GCE SA)
 RUNTIME_SA=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format="value(spec.template.spec.serviceAccountName)")
 if [[ -z "${RUNTIME_SA}" ]]; then
   PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
-  RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.com"
+  RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 fi
-# Use default if above placeholder is missing
-PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
-RUNTIME_SA="${RUNTIME_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
-gsutil iam ch serviceAccount:${RUNTIME_SA}:objectViewer gs://${BUCKET}
 
+# Grant objectViewer on the config bucket to the runtime SA
+gsutil iam ch "serviceAccount:${RUNTIME_SA}:objectViewer" "gs://${BUCKET}"
+
+# Persist basic state for helper scripts
 save_state "$PROJECT_ID" "$REGION" "$SERVICE" "$SERVICE_URL"
 
 echo
