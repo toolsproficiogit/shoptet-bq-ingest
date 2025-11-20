@@ -40,7 +40,7 @@ PROJECT_ID="$(gcloud config get-value project)"
 bq --project_id="$PROJECT_ID" --location=EU mk -d csv_export || true
 ```
 
-> **For a more advanced implementation, you can change the name and location of the dataset. You can even create multiple datasets by running the command repeatedly. However, make sure to remember the names and the corresponding locations as they will be used later.*
+> *For a more advanced implementation, you can change the name and location of the dataset. You can even create multiple datasets by running the command repeatedly. However, make sure to remember the names and the corresponding locations as they will be used later.*
 
 ---
 
@@ -130,6 +130,8 @@ You can edit or add schemas that the service will expect from incoming CSVs. You
 You can inspect the default schemas in the `config/schemas.yaml` file.
 
 When editing these, make sure the column names and data types **exactly match** your CSVs (including hidden characters, trailing spaces etc.), otherwise the columns will be unprocessed. The **parse** refers to the data type as it appears in the CSV, The **type** refers to the data type this field will be saved as to BigQuery.
+
+> *This tool will automatically add two extra columns to each CSV export to make data aggregation and reporting easier:* **date_only** *parses date from datetime to facilitate daily aggregation.* **identifier** *adds a column with pipeline ID to each pipeline to ensure the data can be properly identified and segmented later. This can be handy especially if you push data from multiple CSVs into a single table.*
 
 ### 2) Deploy (uploads YAML to GCS, sets CONFIG_URL, deploys service)
 ```bash
