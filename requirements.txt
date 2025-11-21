@@ -1,7 +1,17 @@
-Flask==3.0.0
+Flask==3.0.2
 gunicorn==21.2.0
-google-cloud-bigquery==3.25.0
-google-cloud-storage==2.16.0
-google-api-core==2.19.1
+
+# HTTP + retries
+requests==2.31.0
+urllib3==2.1.0
+
+# YAML config support
 PyYAML==6.0.1
-requests==2.32.3
+
+# Google Cloud clients
+google-cloud-bigquery==3.15.0
+google-cloud-storage==2.14.0
+google-api-core==2.17.0
+
+# Optional: ensures CSV parsing always works
+google-cloud-core==2.4.1

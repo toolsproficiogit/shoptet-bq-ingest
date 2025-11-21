@@ -108,6 +108,8 @@ gcloud run deploy "${SERVICE}" \
   --region "${REGION}" \
   --platform managed \
   --no-allow-unauthenticated \
+  --memory 1Gi \
+  --timeout 900 \
   --set-env-vars MULTI_MODE=true,CONFIG_URL="${CONFIG_URL}",SCHEMA_URL="${SCHEMA_URL}",BQ_LOCATION="${BQ_LOCATION}"
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')

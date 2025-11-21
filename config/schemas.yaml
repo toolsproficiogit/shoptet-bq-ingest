@@ -2,7 +2,7 @@ export_types:
   basic:
     - name: date
       source: date
-      type: DATETIME
+      type: TIMESTAMP
       parse: datetime
     - name: orderItemType
       source: orderItemType
@@ -16,7 +16,7 @@ export_types:
   orders:
     - name: date
       source: date
-      type: DATETIME
+      type: TIMESTAMP
       parse: datetime
     - name: orderItemTotalPriceWithoutVat
       source: orderItemTotalPriceWithoutVat
@@ -50,7 +50,7 @@ export_types:
   customers:
     - name: date
       source: date
-      type: DATETIME
+      type: TIMESTAMP
       parse: datetime
     - name: email
       source: email
