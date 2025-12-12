@@ -277,6 +277,10 @@ def _coerce_for_json(rows: List[Dict[str, Any]], schema_def: Optional[List[Dict[
     """
     Coerce row data to JSON-serializable format, enforcing types based on schema.
     This ensures that STRING fields remain strings even if they contain numeric values.
+    
+    Args:
+        rows: List of row dictionaries
+        schema_def: Schema definition list with 'name' and 'type' keys
     """
     out: List[Dict[str, Any]] = []
     
@@ -284,8 +288,11 @@ def _coerce_for_json(rows: List[Dict[str, Any]], schema_def: Optional[List[Dict[
     string_fields = set()
     if schema_def:
         for field in schema_def:
-            if field.get("type") == "STRING":
+            field_type = field.get("type", "").upper()
+            if field_type == "STRING":
                 string_fields.add(field.get("name"))
+    
+    log.debug(f"STRING fields to enforce: {string_fields}")
     
     for r in rows:
         rr = dict(r)
@@ -295,7 +302,8 @@ def _coerce_for_json(rows: List[Dict[str, Any]], schema_def: Optional[List[Dict[
         for field_name in string_fields:
             if field_name in rr and rr[field_name] is not None:
                 # Ensure the value is a string
-                rr[field_name] = str(rr[field_name])
+                if not isinstance(rr[field_name], str):
+                    rr[field_name] = str(rr[field_name])
         
         # Handle datetime conversions
         v = rr.get("date")
@@ -392,12 +400,27 @@ def load_to_staging_batched(
 
     bq.create_table(bigquery.Table(staging, schema=schema_fields))
     
+    log.info("Loading %d rows to staging table %s with schema enforcement", len(rows), staging)
+    
+    # Create job config with explicit schema to prevent type inference
+    # This is critical: BigQuery will infer types from JSON if we don't specify the schema
+    job_config = bigquery.LoadJobConfig()
+    job_config.schema = schema_fields
+    job_config.schema_update_options = [bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
+    
     # Load in batches to reduce memory footprint
     total_loaded = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         json_rows = _coerce_for_json(batch, schema_def=schema_def)
-        job = bq.load_table_from_json(json_rows, staging, location=location)
+        log.debug(f"Batch {i//batch_size + 1}: Sample row keys: {list(json_rows[0].keys()) if json_rows else []}")
+        # Use job_config to enforce schema and prevent type inference
+        job = bq.load_table_from_json(
+            json_rows, 
+            staging, 
+            location=location,
+            job_config=job_config
+        )
         job.result()
         total_loaded += len(json_rows)
         log.info("Loaded batch %d rows to staging %s (total: %d)", len(json_rows), staging, total_loaded)
