@@ -6,6 +6,11 @@ pipelines:
     bq_table_id: <PROJECT>.csv_export.client1_orders
     load_mode: auto
     window_days: 30
+    # Deduplication mode: no_dedupe, auto_dedupe (default), or full_dedupe
+    # - no_dedupe: Keep all rows, no deduplication
+    # - auto_dedupe: Remove duplicates based on key fields (identifier, date, etc.)
+    # - full_dedupe: Remove rows that are completely identical across all fields
+    dedupe_mode: auto_dedupe
 
   - id: client1_customers
     export_type: customers  
@@ -13,3 +18,4 @@ pipelines:
     bq_table_id: <PROJECT>.csv_export.client1_customers
     load_mode: auto
     window_days: 30
+    dedupe_mode: auto_dedupe

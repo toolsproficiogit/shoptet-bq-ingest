@@ -7,7 +7,7 @@ import time
 import json
 import logging
 from datetime import datetime, timedelta, date
-from typing import List, Dict, Any, Tuple, Optional, Union, Iterator
+from typing import List, Dict, Any, Tuple, Optional, Union, Iterator, Set
 
 import requests
 import yaml
@@ -28,6 +28,20 @@ logging.basicConfig(
 log = logging.getLogger("shoptet-bq")
 
 app = Flask(__name__)
+
+# Constants for memory-efficient processing
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5000"))  # Rows per batch for BigQuery load
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1048576"))  # 1MB chunks for HTTP streaming
+
+# Deduplication modes
+DEDUPE_MODES = {"no_dedupe", "auto_dedupe", "full_dedupe"}
+DEFAULT_DEDUPE_MODE = "auto_dedupe"
+
+# Data type mapping for consistency (DATETIME -> TIMESTAMP)
+BQ_TYPE_NORMALIZE = {
+    "DATETIME": "TIMESTAMP",
+    "datetime": "TIMESTAMP",
+}
 
 # ----------------------------------------------------------------------
 # Helpers: GCS, encoding, HTTP retries/timeouts
@@ -96,6 +110,7 @@ def fetch_text_from_url(
     Fetch bytes from HTTPS or GCS and decode using robust fallback logic.
     Memory-safe:
       - uses bytearray (no list of chunks)
+      - streams in configurable chunks
     """
     if timeout_sec is None:
         timeout_sec = int(os.getenv("DEFAULT_HTTP_TIMEOUT", "300"))
@@ -125,7 +140,7 @@ def fetch_text_from_url(
     r.raise_for_status()
 
     buf = bytearray()
-    for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
+    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
         if chunk:
             buf.extend(chunk)
 
@@ -179,7 +194,7 @@ PARSERS = {
 }
 
 # ----------------------------------------------------------------------
-# CSV streaming reader (Fix #1: skip blank headers + no raw_rows list)
+# CSV streaming reader (memory-optimized)
 # ----------------------------------------------------------------------
 def iter_shoptet_csv(csv_text: str) -> Tuple[List[str], Iterator[Dict[str, str]], List[str]]:
     """
@@ -217,16 +232,19 @@ def iter_shoptet_csv(csv_text: str) -> Tuple[List[str], Iterator[Dict[str, str]]
 
             yield dict(zip(headers, filtered))
 
-    # Prime generator to ensure headers are set if first rows are blank
     g = gen()
-    # We won't iterate here, headers will be set when gen runs.
-    return [], g, errors  # headers filled later
+    return [], g, errors
 
 # ----------------------------------------------------------------------
 # BigQuery helpers
 # ----------------------------------------------------------------------
 def bq_client() -> bigquery.Client:
     return bigquery.Client()
+
+
+def normalize_bq_type(bq_type: str) -> str:
+    """Normalize data types for consistency (DATETIME -> TIMESTAMP)."""
+    return BQ_TYPE_NORMALIZE.get(bq_type, bq_type)
 
 
 def ensure_table_with_schema(
@@ -282,7 +300,8 @@ def _choose_keys(existing_fields: List[str]) -> Tuple[str, ...]:
     return ("identifier", "date")
 
 
-def _dedupe(rows: List[Dict[str, Any]], key_fields: Tuple[str, ...]) -> List[Dict[str, Any]]:
+def _dedupe_auto(rows: List[Dict[str, Any]], key_fields: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    """Auto deduplication: keep last occurrence based on key fields."""
     seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     for r in rows:
         k = tuple(r.get(kf) for kf in key_fields)
@@ -290,14 +309,50 @@ def _dedupe(rows: List[Dict[str, Any]], key_fields: Tuple[str, ...]) -> List[Dic
     return list(seen.values())
 
 
-def load_to_staging(
+def _dedupe_full(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Full deduplication: remove rows that are completely identical across all fields."""
+    seen: Set[str] = set()
+    result: List[Dict[str, Any]] = []
+    for r in rows:
+        # Create a hashable representation of the entire row
+        row_hash = json.dumps(r, sort_keys=True, default=str)
+        if row_hash not in seen:
+            seen.add(row_hash)
+            result.append(r)
+    return result
+
+
+def _dedupe_none(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """No deduplication: return rows as-is."""
+    return rows
+
+
+def apply_deduplication(
+    rows: List[Dict[str, Any]],
+    dedupe_mode: str,
+    key_fields: Tuple[str, ...],
+) -> List[Dict[str, Any]]:
+    """Apply deduplication based on configured mode."""
+    if dedupe_mode == "no_dedupe":
+        return _dedupe_none(rows)
+    elif dedupe_mode == "full_dedupe":
+        return _dedupe_full(rows)
+    else:  # auto_dedupe (default)
+        return _dedupe_auto(rows, key_fields)
+
+
+def load_to_staging_batched(
     bq: bigquery.Client,
     rows: List[Dict[str, Any]],
     target_table: str,
     schema_fields: List[bigquery.SchemaField],
     location: str,
-    key_fields: Tuple[str, ...],
+    batch_size: int = BATCH_SIZE,
 ) -> Optional[str]:
+    """
+    Load rows to staging table in batches to reduce memory usage.
+    Returns staging table name or None if no rows.
+    """
     if not rows:
         return None
 
@@ -305,12 +360,18 @@ def load_to_staging(
     staging = f"{dataset}._stg_{int(time.time())}"
 
     bq.create_table(bigquery.Table(staging, schema=schema_fields))
-    deduped = _dedupe(rows, key_fields)
-    json_rows = _coerce_for_json(deduped)
-
-    job = bq.load_table_from_json(json_rows, staging, location=location)
-    job.result()
-    log.info("Loaded %d rows to staging %s", len(json_rows), staging)
+    
+    # Load in batches to reduce memory footprint
+    total_loaded = 0
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        json_rows = _coerce_for_json(batch)
+        job = bq.load_table_from_json(json_rows, staging, location=location)
+        job.result()
+        total_loaded += len(json_rows)
+        log.info("Loaded batch %d rows to staging %s (total: %d)", len(json_rows), staging, total_loaded)
+    
+    log.info("Completed loading %d rows to staging %s", total_loaded, staging)
     return staging
 
 
@@ -322,7 +383,8 @@ def merge_staging(
     key_fields: Tuple[str, ...],
 ):
     """
-    Fix #2: only reference columns that exist in BOTH staging and target.
+    Merge staging into target table.
+    Only references columns that exist in BOTH staging and target.
     Allows columns to be dropped or renamed without breaking MERGE.
     """
     tgt = bq.get_table(target)
@@ -358,7 +420,7 @@ def merge_staging(
 # Schema library
 # ----------------------------------------------------------------------
 DEFAULT_SCHEMA_DEF = [
-    {"name": "date", "source": "date", "type": "DATETIME", "parse": "datetime"},
+    {"name": "date", "source": "date", "type": "TIMESTAMP", "parse": "datetime"},
     {"name": "orderItemType", "source": "orderItemType", "type": "STRING", "parse": "string"},
     {"name": "orderItemTotalPriceWithoutVat", "source": "orderItemTotalPriceWithoutVat", "type": "FLOAT", "parse": "decimal_comma"},
     {"name": "identifier", "source": None, "type": "STRING", "parse": "string"},
@@ -395,6 +457,11 @@ def schema_from_config(
             base = list(schema_lib[export_type])
         else:
             base = list(DEFAULT_SCHEMA_DEF)
+
+    # Normalize data types for consistency
+    for field in base:
+        if "type" in field:
+            field["type"] = normalize_bq_type(field["type"])
 
     names = {f["name"] for f in base}
     if "identifier" not in names:
@@ -453,7 +520,7 @@ def health_checks(rows: List[Dict[str, Any]], key_fields: Tuple[str, ...]) -> Li
     return issues
 
 # ----------------------------------------------------------------------
-# Pipeline runner (streamed parsing)
+# Pipeline runner (with error isolation)
 # ----------------------------------------------------------------------
 def process_pipeline(
     p: Dict[str, Any],
@@ -461,124 +528,169 @@ def process_pipeline(
     allow_unknown: bool,
     schema_lib: Dict[str, List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
+    """
+    Process a single pipeline with error isolation.
+    Returns result dict with status and details.
+    """
     pipeline_id = p.get("id") or "unknown"
     csv_url = p["csv_url"]
     table_id = p["bq_table_id"]
 
     load_mode = (p.get("load_mode") or os.getenv("LOAD_MODE", "auto")).lower()
     window_days = int(p.get("window_days", os.getenv("WINDOW_DAYS", 30)))
+    dedupe_mode = (p.get("dedupe_mode") or os.getenv("DEDUPE_MODE", DEFAULT_DEDUPE_MODE)).lower()
 
     timeout_sec = int(p.get("timeout_sec", os.getenv("DEFAULT_HTTP_TIMEOUT", "300")))
     retries = int(p.get("retries", os.getenv("DEFAULT_HTTP_RETRIES", "3")))
 
+    # Validate dedupe mode
+    if dedupe_mode not in DEDUPE_MODES:
+        log.warning("Invalid dedupe_mode '%s' for pipeline %s, using default", dedupe_mode, pipeline_id)
+        dedupe_mode = DEFAULT_DEDUPE_MODE
+
     schema_def = schema_from_config(p, schema_lib)
     bq_fields = bq_fields_from_schema(schema_def)
 
-    bq_cli = bq_client()
-    table = ensure_table_with_schema(bq_cli, table_id, bq_fields)
+    try:
+        bq_cli = bq_client()
+        table = ensure_table_with_schema(bq_cli, table_id, bq_fields)
 
-    if load_mode not in {"auto", "full", "window"}:
-        load_mode = "auto"
-    if load_mode == "auto":
-        effective_mode = "full" if is_table_empty(bq_cli, table_id) else "window"
-    else:
-        effective_mode = load_mode
+        if load_mode not in {"auto", "full", "window"}:
+            load_mode = "auto"
+        if load_mode == "auto":
+            effective_mode = "full" if is_table_empty(bq_cli, table_id) else "window"
+        else:
+            effective_mode = load_mode
 
-    cutoff = datetime.now() - timedelta(days=window_days) if effective_mode == "window" else None
+        cutoff = datetime.now() - timedelta(days=window_days) if effective_mode == "window" else None
 
-    pipeline_encoding = p.get("encoding") or os.getenv("DEFAULT_CSV_ENCODING", "auto")
-    csv_text = fetch_text_from_url(
-        csv_url,
-        preferred_encoding=pipeline_encoding,
-        timeout_sec=timeout_sec,
-        retries=retries,
-    )
+        pipeline_encoding = p.get("encoding") or os.getenv("DEFAULT_CSV_ENCODING", "auto")
+        
+        try:
+            csv_text = fetch_text_from_url(
+                csv_url,
+                preferred_encoding=pipeline_encoding,
+                timeout_sec=timeout_sec,
+                retries=retries,
+            )
+        except Exception as e:
+            log.exception("Failed to fetch CSV for pipeline %s: %s", pipeline_id, e)
+            return {
+                "pipeline": pipeline_id,
+                "table": table_id,
+                "status": "error_fetch",
+                "message": f"Failed to fetch CSV: {str(e)}",
+                "error_type": type(e).__name__,
+            }
 
-    # Stream parse
-    headers_empty, rec_iter, parse_errors = iter_shoptet_csv(csv_text)
+        # Stream parse
+        headers_empty, rec_iter, parse_errors = iter_shoptet_csv(csv_text)
 
-    # We need real headers -> get them by re-reading the first line quickly
-    # (cheap; avoids holding raw_rows)
-    raw_first = next(csv.reader(io.StringIO(csv_text), delimiter=";", quotechar='"'))
-    raw_headers = [(h or "").strip().lstrip("\ufeff") for h in raw_first]
-    keep_idx = [i for i, h in enumerate(raw_headers) if h != ""]
-    headers = [raw_headers[i] for i in keep_idx]
+        # Get headers by re-reading the first line
+        raw_first = next(csv.reader(io.StringIO(csv_text), delimiter=";", quotechar='"'))
+        raw_headers = [(h or "").strip().lstrip("\ufeff") for h in raw_first]
+        keep_idx = [i for i, h in enumerate(raw_headers) if h != ""]
+        headers = [raw_headers[i] for i in keep_idx]
 
-    schema_sources = [f["source"] for f in schema_def if f.get("source")]
-    header_set = set(headers)
-    source_set = set(schema_sources)
+        schema_sources = [f["source"] for f in schema_def if f.get("source")]
+        header_set = set(headers)
+        source_set = set(schema_sources)
 
-    unknown_csv_cols = sorted(c for c in (header_set - source_set) if c != "")
-    missing_schema_cols = sorted(source_set - header_set)
+        unknown_csv_cols = sorted(c for c in (header_set - source_set) if c != "")
+        missing_schema_cols = sorted(source_set - header_set)
 
-    if unknown_csv_cols and not allow_unknown:
+        if unknown_csv_cols and not allow_unknown:
+            return {
+                "pipeline": pipeline_id,
+                "table": table_id,
+                "status": "blocked_unknown_columns",
+                "unknown_columns": unknown_csv_cols,
+                "missing_columns": missing_schema_cols,
+                "message": "Unknown CSV columns detected. Re-run with ?allow_unknown=1 or set ALLOW_UNKNOWN_COLUMNS=true.",
+            }
+
+        kept: List[Dict[str, Any]] = []
+        parsed_count = 0
+
+        # Rebuild iterator from filtered indices
+        def filtered_records():
+            f = io.StringIO(csv_text)
+            reader = csv.reader(f, delimiter=";", quotechar='"')
+            # skip header
+            for rec in reader:
+                if not rec or all((c or "").strip() == "" for c in rec):
+                    continue
+                raw_headers_local = [(h or "").strip().lstrip("\ufeff") for h in rec]
+                keep_idx_local = [i for i, h in enumerate(raw_headers_local) if h != ""]
+                headers_local = [raw_headers_local[i] for i in keep_idx_local]
+                break
+            for rec in reader:
+                if not rec or all((c or "").strip() == "" for c in rec):
+                    continue
+                filtered = [rec[i] if i < len(rec) else "" for i in keep_idx]
+                if len(filtered) != len(headers):
+                    continue
+                yield dict(zip(headers, filtered))
+
+        for rec in filtered_records():
+            parsed_count += 1
+            row = build_row_from_record(rec, schema_def, pipeline_id)
+            dt = row.get("date")
+            if dt is None:
+                continue
+            if cutoff and isinstance(dt, datetime) and dt < cutoff:
+                continue
+            kept.append(row)
+
+        key_fields = _choose_keys([f.name for f in table.schema])
+        
+        # Apply deduplication based on mode
+        kept = apply_deduplication(kept, dedupe_mode, key_fields)
+        
+        issues = health_checks(kept, key_fields)
+
+        staging = load_to_staging_batched(bq_cli, kept, table_id, bq_fields, bq_loc)
+        if staging:
+            merge_staging(bq_cli, staging, table_id, bq_loc, key_fields)
+
         return {
             "pipeline": pipeline_id,
             "table": table_id,
-            "status": "blocked_unknown_columns",
+            "status": "ok",
+            "headers": headers,
+            "parsed_rows": parsed_count,
+            "kept_rows": len(kept),
+            "parse_errors": len(parse_errors),
+            "health_issues": issues,
             "unknown_columns": unknown_csv_cols,
             "missing_columns": missing_schema_cols,
-            "message": "Unknown CSV columns detected. Re-run with ?allow_unknown=1 or set ALLOW_UNKNOWN_COLUMNS=true.",
+            "mode": effective_mode,
+            "window_days": window_days if effective_mode == "window" else None,
+            "key_fields": key_fields,
+            "dedupe_mode": dedupe_mode,
+            "encoding": pipeline_encoding,
+            "timeout_sec": timeout_sec,
+            "retries": retries,
         }
 
-    kept: List[Dict[str, Any]] = []
-    parsed_count = 0
-
-    # Rebuild iterator from filtered indices
-    def filtered_records():
-        f = io.StringIO(csv_text)
-        reader = csv.reader(f, delimiter=";", quotechar='"')
-        # skip header
-        for rec in reader:
-            if not rec or all((c or "").strip() == "" for c in rec):
-                continue
-            raw_headers_local = [(h or "").strip().lstrip("\ufeff") for h in rec]
-            keep_idx_local = [i for i, h in enumerate(raw_headers_local) if h != ""]
-            headers_local = [raw_headers_local[i] for i in keep_idx_local]
-            break
-        for rec in reader:
-            if not rec or all((c or "").strip() == "" for c in rec):
-                continue
-            filtered = [rec[i] if i < len(rec) else "" for i in keep_idx]
-            if len(filtered) != len(headers):
-                continue
-            yield dict(zip(headers, filtered))
-
-    for rec in filtered_records():
-        parsed_count += 1
-        row = build_row_from_record(rec, schema_def, pipeline_id)
-        dt = row.get("date")
-        if dt is None:
-            continue
-        if cutoff and isinstance(dt, datetime) and dt < cutoff:
-            continue
-        kept.append(row)
-
-    key_fields = _choose_keys([f.name for f in table.schema])
-    issues = health_checks(kept, key_fields)
-
-    staging = load_to_staging(bq_cli, kept, table_id, bq_fields, bq_loc, key_fields)
-    if staging:
-        merge_staging(bq_cli, staging, table_id, bq_loc, key_fields)
-
-    return {
-        "pipeline": pipeline_id,
-        "table": table_id,
-        "status": "ok",
-        "headers": headers,
-        "parsed_rows": parsed_count,
-        "kept_rows": len(kept),
-        "parse_errors": len(parse_errors),
-        "health_issues": issues,
-        "unknown_columns": unknown_csv_cols,
-        "missing_columns": missing_schema_cols,
-        "mode": effective_mode,
-        "window_days": window_days if effective_mode == "window" else None,
-        "key_fields": key_fields,
-        "encoding": pipeline_encoding,
-        "timeout_sec": timeout_sec,
-        "retries": retries,
-    }
+    except BadRequest as e:
+        log.exception("BigQuery error on pipeline %s", pipeline_id)
+        return {
+            "pipeline": pipeline_id,
+            "table": table_id,
+            "status": "error_bigquery",
+            "message": f"BigQuery error: {str(e)}",
+            "error_type": "BadRequest",
+        }
+    except Exception as e:
+        log.exception("Unhandled error on pipeline %s", pipeline_id)
+        return {
+            "pipeline": pipeline_id,
+            "table": table_id,
+            "status": "error_unhandled",
+            "message": f"Unhandled error: {str(e)}",
+            "error_type": type(e).__name__,
+        }
 
 # ----------------------------------------------------------------------
 # Flask endpoints
@@ -626,15 +738,41 @@ def run_ingest():
         pipelines = all_pipes
 
     results: List[Dict[str, Any]] = []
+    failed_pipelines: List[str] = []
+    
+    # Process pipelines sequentially with error isolation
     for p in pipelines:
+        pipeline_id = p.get("id", "unknown")
         try:
-            results.append(process_pipeline(p, bq_location, allow_unknown, schema_lib))
-        except BadRequest as e:
-            log.exception("BigQuery error on pipeline %s", p.get("id"))
-            return jsonify({"status": "error", "message": str(e)}), 500
+            result = process_pipeline(p, bq_location, allow_unknown, schema_lib)
+            results.append(result)
+            
+            # Track failed pipelines
+            if result.get("status") != "ok":
+                failed_pipelines.append(pipeline_id)
+                log.warning("Pipeline %s failed with status: %s", pipeline_id, result.get("status"))
         except Exception as e:
-            log.exception("Unhandled error on pipeline %s", p.get("id"))
-            return jsonify({"status": "error", "message": str(e)}), 500
+            # This should not happen due to error handling in process_pipeline,
+            # but catch any unexpected errors to ensure continuation
+            log.exception("Unexpected error processing pipeline %s", pipeline_id)
+            results.append({
+                "pipeline": pipeline_id,
+                "table": p.get("bq_table_id", "unknown"),
+                "status": "error_unexpected",
+                "message": f"Unexpected error: {str(e)}",
+                "error_type": type(e).__name__,
+            })
+            failed_pipelines.append(pipeline_id)
 
     elapsed = round(time.time() - start, 2)
-    return jsonify({"status": "ok", "elapsed_sec": elapsed, "results": results})
+    
+    # Determine overall status
+    overall_status = "ok" if not failed_pipelines else "partial_failure"
+    
+    return jsonify({
+        "status": overall_status,
+        "elapsed_sec": elapsed,
+        "total_pipelines": len(pipelines),
+        "failed_pipelines": failed_pipelines,
+        "results": results
+    })
