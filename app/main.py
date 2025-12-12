@@ -273,10 +273,31 @@ def is_table_empty(bq: bigquery.Client, table_id: str) -> bool:
     return res[0]["c"] == 0
 
 
-def _coerce_for_json(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _coerce_for_json(rows: List[Dict[str, Any]], schema_def: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """
+    Coerce row data to JSON-serializable format, enforcing types based on schema.
+    This ensures that STRING fields remain strings even if they contain numeric values.
+    """
     out: List[Dict[str, Any]] = []
+    
+    # Build a map of field names to their expected types
+    string_fields = set()
+    if schema_def:
+        for field in schema_def:
+            if field.get("type") == "STRING":
+                string_fields.add(field.get("name"))
+    
     for r in rows:
         rr = dict(r)
+        
+        # Enforce STRING type for fields that should be strings
+        # This prevents JSON serialization from converting "123" to 123
+        for field_name in string_fields:
+            if field_name in rr and rr[field_name] is not None:
+                # Ensure the value is a string
+                rr[field_name] = str(rr[field_name])
+        
+        # Handle datetime conversions
         v = rr.get("date")
         if isinstance(v, datetime):
             rr["date"] = v.strftime("%Y-%m-%d %H:%M:%S")
@@ -347,11 +368,21 @@ def load_to_staging_batched(
     target_table: str,
     schema_fields: List[bigquery.SchemaField],
     location: str,
+    schema_def: Optional[List[Dict[str, Any]]] = None,
     batch_size: int = BATCH_SIZE,
 ) -> Optional[str]:
     """
     Load rows to staging table in batches to reduce memory usage.
     Returns staging table name or None if no rows.
+    
+    Args:
+        bq: BigQuery client
+        rows: List of row dictionaries to load
+        target_table: Target table ID
+        schema_fields: BigQuery schema fields
+        location: BigQuery location
+        schema_def: Schema definition (used to enforce STRING types)
+        batch_size: Number of rows per batch
     """
     if not rows:
         return None
@@ -365,7 +396,7 @@ def load_to_staging_batched(
     total_loaded = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
-        json_rows = _coerce_for_json(batch)
+        json_rows = _coerce_for_json(batch, schema_def=schema_def)
         job = bq.load_table_from_json(json_rows, staging, location=location)
         job.result()
         total_loaded += len(json_rows)
@@ -649,7 +680,7 @@ def process_pipeline(
         
         issues = health_checks(kept, key_fields)
 
-        staging = load_to_staging_batched(bq_cli, kept, table_id, bq_fields, bq_loc)
+        staging = load_to_staging_batched(bq_cli, kept, table_id, bq_fields, bq_loc, schema_def=schema_def)
         if staging:
             merge_staging(bq_cli, staging, table_id, bq_loc, key_fields)
 
