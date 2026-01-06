@@ -414,15 +414,17 @@ The name of the column in the CSV file. If different from the BigQuery column na
 
 **Type:** String  
 **Default:** `string`  
-**Valid values:** `string`, `int`, `integer`, `float`, `date`, `timestamp`
+**Valid values:** `string`, `int`, `float`, `datetime`, `date_only`, `bool`, `decimal_comma`
 
 How to parse the value from the CSV before storing in BigQuery:
 
-- **`string`**: Keep as text (default)
-- **`int` or `integer`**: Convert to whole number
-- **`float`**: Convert to decimal number
-- **`date`**: Parse as date (YYYY-MM-DD format)
-- **`timestamp`**: Parse as date and time (ISO 8601 format)
+- **`string`**: (Default) Reads the value as a string and strips leading/trailing whitespace and quotes.
+- **`int`**: Converts a string to an integer.
+- **`float`**: Converts a string to a standard float.
+- **`datetime`**: Parses a date/time string into a standard datetime object. Supports common formats like YYYY-MM-DD HH:MM:SS, YYYY-MM-DDTHH:MM:SS, and ISO 8601.
+- **`date_only`**: Parses a date/time string and returns only the date part in YYYY-MM-DD format.
+- **`bool`**: Converts a string to a boolean. true, 1, t, yes, y are treated as True.
+- **`decimal_comma`**: Converts a string with a comma as the decimal separator (e.g., "123,45") to a standard float (123.45). This is common in European number formats.
 
 ---
 
