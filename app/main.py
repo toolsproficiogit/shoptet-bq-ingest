@@ -10,6 +10,7 @@ Optimized version with:
 - Data type consistency (DATETIME → TIMESTAMP)
 - Google Sheets and YAML configuration support
 - Schema validation and migration strategy
+- Full parser support (decimal_comma, datetime, date_only, etc.)
 """
 
 import csv
@@ -19,7 +20,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import yaml
 from flask import Flask
@@ -51,6 +52,65 @@ DEDUPE_MODES = {"no_dedupe", "auto_dedupe", "full_dedupe"}
 DEFAULT_DEDUPE_MODE = "auto_dedupe"
 
 # ======================================================================
+# PARSER FUNCTIONS
+# ======================================================================
+
+def decimal_comma_to_float(s: Optional[str]) -> Optional[float]:
+    """Parse decimal number with comma as decimal separator (European format)."""
+    if s is None:
+        return None
+    s = str(s).strip().strip('"').strip("'")
+    if s == "" or s.lower() in {"na", "nan", "null"}:
+        return None
+    # Replace . with empty and , with . to convert to standard float format
+    normalized = s.replace(".", "").replace(",", ".")
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def parse_datetime(s: Optional[Union[str, datetime]]) -> Optional[datetime]:
+    """Parse datetime string in common formats."""
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s
+    s = str(s).strip().strip('"').strip("'")
+    if not s:
+        return None
+    # Try common datetime formats
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    # Try ISO format with timezone
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def parse_date_only(s: Optional[Union[str, datetime]]) -> Optional[str]:
+    """Parse date string and return as ISO date string (YYYY-MM-DD)."""
+    dt = s if isinstance(s, datetime) else parse_datetime(s)
+    return dt.date().isoformat() if dt else None
+
+
+# Parser registry - maps parse type names to parser functions
+PARSERS = {
+    "string": lambda v: (str(v).strip().strip('"').strip("'") if v not in (None, "") else None),
+    "float": lambda v: float(v) if v not in (None, "", "null", "NaN") else None,
+    "int": lambda v: int(float(v)) if v not in (None, "", "null", "NaN") else None,
+    "bool": lambda v: (str(v).strip().lower() in {"1", "true", "t", "yes", "y"}) if v not in (None, "") else None,
+    "datetime": parse_datetime,
+    "date_only": parse_date_only,
+    "decimal_comma": decimal_comma_to_float,
+}
+
+# ======================================================================
 # UTILITY FUNCTIONS
 # ======================================================================
 
@@ -62,6 +122,45 @@ def _choose_keys(field_names: List[str]) -> Tuple[str, ...]:
             return (cand,)
     # Fallback: use first field if no standard key found
     return (field_names[0],) if field_names else ("id",)
+
+
+def build_row_from_record(
+    rec: Dict[str, Any], 
+    schema_def: List[Dict[str, Any]], 
+    pipeline_id: str
+) -> Dict[str, Any]:
+    """
+    Build a row from a CSV record using the schema definition.
+    Applies appropriate parsers to each field based on the 'parse' type.
+    """
+    row: Dict[str, Any] = {}
+    
+    for field_def in schema_def:
+        name = field_def.get("name")
+        source = field_def.get("source")
+        parser_key = field_def.get("parse", "string")
+        
+        # Get the parser function for this field type
+        parser = PARSERS.get(parser_key, PARSERS["string"])
+        
+        # Apply parser to the source field value
+        if source:
+            raw_value = rec.get(source)
+            row[name] = parser(raw_value)
+        else:
+            # No source means this is a computed/generated field
+            row[name] = None
+    
+    # Add identifier
+    row["identifier"] = pipeline_id
+    
+    # Add date_only if date field exists
+    if "date" in row and row["date"] is not None:
+        row["date_only"] = parse_date_only(row["date"])
+    else:
+        row["date_only"] = None
+    
+    return row
 
 
 def _coerce_for_json(
@@ -90,6 +189,11 @@ def _coerce_for_json(
             if field_name in rr and rr[field_name] is not None:
                 # Ensure the value is a string
                 rr[field_name] = str(rr[field_name])
+        
+        # Convert datetime objects to ISO format strings for JSON serialization
+        for key, value in rr.items():
+            if isinstance(value, datetime):
+                rr[key] = value.isoformat()
         
         out.append(rr)
     return out
@@ -475,8 +579,8 @@ def schema_from_config(
             base = []
     
     # Add auto-generated columns
-    base.append({"name": "identifier", "type": "STRING", "mode": "NULLABLE"})
-    base.append({"name": "date_only", "type": "DATE", "mode": "NULLABLE"})
+    base.append({"name": "identifier", "type": "STRING", "mode": "NULLABLE", "parse": "string"})
+    base.append({"name": "date_only", "type": "DATE", "mode": "NULLABLE", "parse": "date_only"})
     
     return base
 
@@ -661,36 +765,27 @@ def process_pipeline(
                 "message": str(e),
             }
         
-        # Parse CSV
+        # Parse CSV and build rows using schema parsers
         rows = []
         try:
             reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
-            for row_dict in reader:
-                if not row_dict or all(v is None or v == "" for v in row_dict.values()):
+            for csv_record in reader:
+                if not csv_record or all(v is None or v == "" for v in csv_record.values()):
                     continue
                 
-                # Add identifier and date_only
-                row_dict["identifier"] = pipeline_id
-                if "date" in row_dict:
-                    try:
-                        dt = datetime.fromisoformat(row_dict["date"].replace("Z", "+00:00"))
-                        row_dict["date_only"] = dt.date()
-                    except Exception:
-                        pass
+                # Build row using schema parsers
+                row = build_row_from_record(csv_record, schema_def, pipeline_id)
                 
                 # Filter by window if needed
                 if effective_mode == "window":
-                    dt = row_dict.get("date")
+                    dt = row.get("date")
                     if dt:
-                        try:
-                            dt_obj = datetime.fromisoformat(str(dt).replace("Z", "+00:00"))
+                        if isinstance(dt, datetime):
                             cutoff = datetime.now() - timedelta(days=window_days)
-                            if dt_obj < cutoff:
+                            if dt < cutoff:
                                 continue
-                        except Exception:
-                            pass
                 
-                rows.append(row_dict)
+                rows.append(row)
         
         except Exception as e:
             log.exception("Failed to parse CSV for pipeline %s: %s", pipeline_id, e)
