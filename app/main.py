@@ -9,6 +9,7 @@ Optimized version with:
 - Error isolation per pipeline
 - Data type consistency (DATETIME → TIMESTAMP)
 - Google Sheets and YAML configuration support
+- Schema validation and migration strategy
 """
 
 import csv
@@ -40,6 +41,10 @@ log = logging.getLogger(__name__)
 BQ_LOCATION = os.getenv("BQ_LOCATION", "EU")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5000"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1048576"))
+
+# Schema migration strategy
+SCHEMA_MIGRATION_MODE = os.getenv("SCHEMA_MIGRATION_MODE", "strict").lower()
+VALID_SCHEMA_MODES = {"strict", "auto_migrate", "recreate"}
 
 # Deduplication modes
 DEDUPE_MODES = {"no_dedupe", "auto_dedupe", "full_dedupe"}
@@ -99,17 +104,158 @@ def is_table_empty(bq: bigquery.Client, table_id: str) -> bool:
         return True
 
 
+def _normalize_schema_field(field: bigquery.SchemaField) -> Dict[str, Any]:
+    """Convert BigQuery SchemaField to dict for comparison."""
+    return {
+        "name": field.name,
+        "type": field.field_type,
+        "mode": field.mode,
+    }
+
+
+def _schemas_match(
+    existing_schema: List[bigquery.SchemaField],
+    expected_schema: List[bigquery.SchemaField],
+) -> bool:
+    """Check if two schemas match (ignoring descriptions)."""
+    if len(existing_schema) != len(expected_schema):
+        return False
+    
+    existing_dict = {f.name: _normalize_schema_field(f) for f in existing_schema}
+    expected_dict = {f.name: _normalize_schema_field(f) for f in expected_schema}
+    
+    return existing_dict == expected_dict
+
+
+def _get_schema_diff(
+    existing_schema: List[bigquery.SchemaField],
+    expected_schema: List[bigquery.SchemaField],
+) -> Dict[str, Any]:
+    """Get the differences between two schemas."""
+    existing_names = {f.name for f in existing_schema}
+    expected_names = {f.name for f in expected_schema}
+    
+    added_fields = expected_names - existing_names
+    removed_fields = existing_names - expected_names
+    
+    # Check for type changes
+    changed_fields = {}
+    for field in expected_schema:
+        if field.name in existing_names:
+            existing_field = next(f for f in existing_schema if f.name == field.name)
+            if (existing_field.field_type != field.field_type or 
+                existing_field.mode != field.mode):
+                changed_fields[field.name] = {
+                    "existing": f"{existing_field.field_type} ({existing_field.mode})",
+                    "expected": f"{field.field_type} ({field.mode})",
+                }
+    
+    return {
+        "added": sorted(added_fields),
+        "removed": sorted(removed_fields),
+        "changed": changed_fields,
+    }
+
+
+def validate_or_migrate_schema(
+    bq: bigquery.Client,
+    table_id: str,
+    expected_schema: List[bigquery.SchemaField],
+    migration_mode: str,
+) -> None:
+    """
+    Validate or migrate table schema based on migration mode.
+    
+    Modes:
+    - strict: Fail if schema doesn't match (default)
+    - auto_migrate: Add new fields, fail on removals/changes
+    - recreate: Drop and recreate table (data loss!)
+    """
+    try:
+        existing_table = bq.get_table(table_id)
+        existing_schema = existing_table.schema
+        
+        # Check if schemas match
+        if _schemas_match(existing_schema, expected_schema):
+            log.info("Schema for %s matches expected schema", table_id)
+            return
+        
+        # Schemas don't match - handle based on mode
+        diff = _get_schema_diff(existing_schema, expected_schema)
+        
+        if migration_mode == "strict":
+            error_msg = f"Schema mismatch for {table_id}:\n"
+            if diff["added"]:
+                error_msg += f"  Added fields: {', '.join(diff['added'])}\n"
+            if diff["removed"]:
+                error_msg += f"  Removed fields: {', '.join(diff['removed'])}\n"
+            if diff["changed"]:
+                error_msg += f"  Changed fields: {', '.join(diff['changed'].keys())}\n"
+            error_msg += "Set SCHEMA_MIGRATION_MODE=auto_migrate or recreate to handle schema changes."
+            raise ValueError(error_msg)
+        
+        elif migration_mode == "auto_migrate":
+            # Only allow adding new fields
+            if diff["removed"] or diff["changed"]:
+                error_msg = f"Auto-migrate cannot handle removals or changes for {table_id}:\n"
+                if diff["removed"]:
+                    error_msg += f"  Removed fields: {', '.join(diff['removed'])}\n"
+                if diff["changed"]:
+                    error_msg += f"  Changed fields: {', '.join(diff['changed'].keys())}\n"
+                error_msg += "Manually handle these changes or use SCHEMA_MIGRATION_MODE=recreate."
+                raise ValueError(error_msg)
+            
+            # Add new fields
+            if diff["added"]:
+                log.info("Adding new fields to %s: %s", table_id, diff["added"])
+                new_schema = list(existing_schema)
+                for field in expected_schema:
+                    if field.name in diff["added"]:
+                        new_schema.append(field)
+                
+                existing_table.schema = new_schema
+                bq.update_table(existing_table, ["schema"])
+                log.info("Successfully added fields to %s", table_id)
+        
+        elif migration_mode == "recreate":
+            log.warning("RECREATING table %s - DATA WILL BE LOST!", table_id)
+            bq.delete_table(table_id, not_found_ok=True)
+            new_table = bigquery.Table(table_id, schema=expected_schema)
+            bq.create_table(new_table)
+            log.info("Successfully recreated table %s", table_id)
+        
+        else:
+            log.warning("Unknown schema migration mode: %s, using strict", migration_mode)
+            raise ValueError(f"Unknown schema migration mode: {migration_mode}")
+    
+    except Exception as e:
+        if "Not found" in str(e) or "404" in str(e):
+            # Table doesn't exist, will be created
+            log.info("Table %s does not exist, will be created", table_id)
+        else:
+            raise
+
+
 def ensure_table_with_schema(
     bq: bigquery.Client,
     table_id: str,
     schema: List[bigquery.SchemaField],
+    migration_mode: str = "strict",
 ) -> bigquery.Table:
-    """Ensure table exists with the given schema."""
+    """Ensure table exists with the given schema, handling migrations."""
     try:
+        table = bq.get_table(table_id)
+        # Table exists, validate/migrate schema
+        validate_or_migrate_schema(bq, table_id, schema, migration_mode)
         return bq.get_table(table_id)
-    except Exception:
-        table = bigquery.Table(table_id, schema=schema)
-        return bq.create_table(table)
+    except Exception as e:
+        if "Not found" in str(e) or "404" in str(e):
+            # Table doesn't exist, create it
+            log.info("Creating new table %s", table_id)
+            table = bigquery.Table(table_id, schema=schema)
+            return bq.create_table(table)
+        else:
+            raise
 
 
 def bq_fields_from_schema(schema_def: List[Dict[str, Any]]) -> List[bigquery.SchemaField]:
@@ -119,12 +265,18 @@ def bq_fields_from_schema(schema_def: List[Dict[str, Any]]) -> List[bigquery.Sch
         name = field_def.get("name", "")
         bq_type = field_def.get("type", "STRING").upper()
         mode = field_def.get("mode", "NULLABLE").upper()
+        description = field_def.get("description", "")
         
         # Normalize DATETIME to TIMESTAMP for BigQuery compatibility
         if bq_type == "DATETIME":
             bq_type = "TIMESTAMP"
         
-        fields.append(bigquery.SchemaField(name, bq_type, mode=mode))
+        fields.append(bigquery.SchemaField(
+            name, 
+            bq_type, 
+            mode=mode,
+            description=description
+        ))
     
     return fields
 
@@ -454,6 +606,7 @@ def process_pipeline(
     p: Dict[str, Any],
     schema_lib: Dict[str, List[Dict[str, Any]]],
     allow_unknown: bool = False,
+    migration_mode: str = "strict",
 ) -> Dict[str, Any]:
     """Process a single pipeline with error isolation."""
     pipeline_id = p.get("id") or "unknown"
@@ -481,7 +634,7 @@ def process_pipeline(
     
     try:
         bq_cli = bigquery.Client()
-        table = ensure_table_with_schema(bq_cli, table_id, bq_fields)
+        table = ensure_table_with_schema(bq_cli, table_id, bq_fields, migration_mode)
         
         # Determine effective load mode
         if load_mode not in {"auto", "full", "window"}:
@@ -609,6 +762,7 @@ def trigger():
         schema_lib = provider.get_schema_library()
         
         allow_unknown = os.getenv("ALLOW_UNKNOWN_COLUMNS", "false").lower() == "true"
+        migration_mode = SCHEMA_MIGRATION_MODE if SCHEMA_MIGRATION_MODE in VALID_SCHEMA_MODES else "strict"
         
         # Process each pipeline
         results = []
@@ -616,7 +770,7 @@ def trigger():
             if pipeline.get("active", True) is False:
                 continue
             
-            result = process_pipeline(pipeline, schema_lib, allow_unknown)
+            result = process_pipeline(pipeline, schema_lib, allow_unknown, migration_mode)
             results.append(result)
         
         return {

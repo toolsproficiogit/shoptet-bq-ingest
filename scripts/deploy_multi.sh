@@ -1,243 +1,261 @@
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."  # ensure repo root
+#!/bin/bash
+# Deploy multi-pipeline CSV-to-BigQuery service with schema validation support
 
-# shellcheck disable=SC1091
-. scripts/common.sh
+set -e
 
-echo "== CSV → BigQuery: Multi-pipeline Deploy (YAML or Google Sheets) =="
-echo ""
-
-PROJECT_ID=${PROJECT_ID:-$(active_project)}
-PROJECT_ID=$(prompt_default "Project ID" "${PROJECT_ID}")
-REGION=$(prompt_default "Region" "europe-west1")
-SERVICE=$(prompt_default "Service name" "csv-bq-multi")
-
-# Configuration source selection
-echo ""
-echo "Configuration source:"
-echo "  1) YAML files in GCS (default)"
-echo "  2) Google Sheets"
-echo ""
-CONFIG_SOURCE=$(prompt_default "Select source (1 or 2)" "1")
-
-BQ_LOCATION=$(prompt_default "BigQuery location" "EU")
-
-# Allow unknown columns setting
-echo ""
-echo "Unknown columns handling:"
-echo "  If your CSV exports include unexpected or renamed fields,"
-echo "  enable this to skip unrecognized columns instead of failing."
-echo ""
-ALLOW_UNKNOWN=$(prompt_default "Allow unknown columns (true/false)" "false")
-
-REPO=${REPO:-containers}
-IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:v1"
-
-# Enable required APIs
-echo ""
-echo "📡 Enabling required APIs..."
-APIS_TO_ENABLE=(
-  "run.googleapis.com"
-  "artifactregistry.googleapis.com"
-  "cloudbuild.googleapis.com"
-  "iam.googleapis.com"
-  "bigquery.googleapis.com"
-  "storage-api.googleapis.com"
-  "logging.googleapis.com"
-  "monitoring.googleapis.com"
-  "cloudscheduler.googleapis.com"
-)
-
-# Add Google Sheets APIs if using Sheets config
-if [[ "$CONFIG_SOURCE" == "2" ]]; then
-  APIS_TO_ENABLE+=(
-    "sheets.googleapis.com"
-    "drive.googleapis.com"
-  )
-fi
-
-for api in "${APIS_TO_ENABLE[@]}"; do
-  gcloud services enable "$api" --project="$PROJECT_ID" >/dev/null 2>&1 || true
-done
-echo "✓ APIs enabled"
-
-echo ""
-echo "Ensuring Artifact Registry repo '${REPO}' exists in ${REGION}..."
-if ! gcloud artifacts repositories describe "${REPO}" --location "${REGION}" >/dev/null 2>&1; then
-  gcloud artifacts repositories create "${REPO}" --repository-format=docker --location "${REGION}" --description="Containers"
-fi
-
-# Configuration source handling
-if [[ "$CONFIG_SOURCE" == "2" ]]; then
-  # Google Sheets configuration
-  echo ""
-  echo "🔧 Google Sheets Configuration"
-  echo ""
-  SHEET_ID=$(prompt_default "Google Sheets ID" "")
-  
-  if [[ -z "$SHEET_ID" ]]; then
-    echo "❌ Google Sheets ID is required"
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/common.sh" || {
+    echo "Error: common.sh not found"
     exit 1
-  fi
-  
-  # Set environment variables for Google Sheets
-  ENV_VARS="USE_SOURCE_SHEETS=TRUE,CONFIG_SHEET_ID=${SHEET_ID},BQ_LOCATION=${BQ_LOCATION},ALLOW_UNKNOWN_COLUMNS=${ALLOW_UNKNOWN},BATCH_SIZE=5000,CHUNK_SIZE=1048576,DEDUPE_MODE=auto_dedupe,WINDOW_DAYS=30,LOG_LEVEL=INFO"
-  
-  CONFIG_URL="sheets://${SHEET_ID}"
-  SCHEMA_URL="sheets://${SHEET_ID}"
-  
-else
-  # YAML configuration (default)
-  echo ""
-  echo "📄 YAML Configuration"
-  echo ""
-  LOCAL_YAML=$(prompt_default "Local YAML path" "config/config.yaml")
-  LOCAL_SCHEMAS=$(prompt_default "Schema library path" "config/schemas.yaml")
-  
-  # Config bucket defaults to unique per project
-  DEFAULT_BUCKET="csv-config-${PROJECT_ID}"
-  BUCKET=$(prompt_default "GCS bucket for config" "$DEFAULT_BUCKET")
-  OBJECT_CFG=$(prompt_default "Pipelines object name" "csv_config.yaml")
-  OBJECT_SCH=$(prompt_default "Schemas object name" "schemas.yaml")
-  
-  # Preflight YAML readability + normalize newlines
-  for f in "$LOCAL_YAML" "$LOCAL_SCHEMAS"; do
-    if [[ ! -r "$f" ]]; then echo "❌ Cannot read file: $f"; exit 1; fi
-    sed -i 's/\r$//' "$f" || true
-  done
-  
-  # Make sure inline Python sees these vars
-  export LOCAL_YAML
-  export LOCAL_SCHEMAS
-  
-  # Validate pipelines YAML
-  echo "Validating pipelines YAML..."
-  python3 - <<'PY'
-import yaml,os,sys
-p=os.environ.get("LOCAL_YAML")
-with open(p,"rb") as f:
-    d=yaml.safe_load(f)
-assert isinstance(d,dict), "Top-level must be a mapping"
-pls=d.get("pipelines")
-assert isinstance(pls,list) and len(pls)>0, "'pipelines' must be a non-empty list"
-print("✅ Pipelines YAML OK:", len(pls), "pipeline(s)")
-PY
-  
-  # Validate schema library YAML
-  echo "Validating schema library YAML..."
-  python3 - <<'PY'
-import yaml,os,sys
-p=os.environ.get("LOCAL_SCHEMAS")
-with open(p,"rb") as f:
-    d=yaml.safe_load(f)
-ets=d.get("schemas",{})
-assert isinstance(ets,dict) and len(ets)>=1, "'schemas' must be a mapping with at least one schema"
-for name,fields in ets.items():
-    assert isinstance(fields,list) and all(isinstance(f,dict) for f in fields), f"schema '{name}' must be list of field maps"
-print("✅ Schema library OK:", ", ".join(ets.keys()))
-PY
-  
-  # Duplicate table detection with confirmation
-  echo "Checking for duplicate BigQuery table targets..."
-  DUPES=$(python3 - <<'PY'
-import yaml,os,collections
-p=os.environ.get("LOCAL_YAML")
-with open(p,"rb") as f:
-    d=yaml.safe_load(f)
-cts=collections.Counter(p.get("bq_table_id") for p in d.get("pipelines",[]) if p.get("bq_table_id"))
-dupes=[t for t,c in cts.items() if c>1]
-print(",".join(dupes))
-PY
-  )
-  if [[ -n "$DUPES" ]]; then
-    echo "⚠️  WARNING: Multiple pipelines point to the same BigQuery table(s):"
-    echo "    $DUPES"
-    read -rp "Do you wish to proceed anyway? (Y/N): " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-      echo "❌ Deployment cancelled. Edit your YAML to fix the duplicates."
-      exit 1
+}
+
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
+
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+SERVICE_NAME="${SERVICE_NAME:-csv-bq-multi}"
+REGION="${REGION:-europe-west1}"
+MEMORY="${MEMORY:-2Gi}"
+TIMEOUT="${TIMEOUT:-3600}"
+ALLOW_UNKNOWN_COLUMNS="${ALLOW_UNKNOWN_COLUMNS:-false}"
+SCHEMA_MIGRATION_MODE="${SCHEMA_MIGRATION_MODE:-strict}"
+USE_SOURCE_SHEETS="${USE_SOURCE_SHEETS:-false}"
+CONFIG_SOURCE=""
+CONFIG_URL=""
+SCHEMA_URL=""
+CONFIG_SHEET_ID=""
+
+# ======================================================================
+# FUNCTIONS
+# ======================================================================
+
+print_header() {
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  CSV-to-BigQuery Cloud Run Service Deployment              ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+prompt_configuration_source() {
+    echo "Select configuration source:"
+    echo "  1) YAML files (default)"
+    echo "  2) Google Sheets"
+    echo ""
+    read -p "Enter choice (1 or 2) [1]: " choice
+    choice=${choice:-1}
+    
+    if [ "$choice" = "2" ]; then
+        USE_SOURCE_SHEETS="true"
+        read -p "Enter Google Sheets ID: " CONFIG_SHEET_ID
+        if [ -z "$CONFIG_SHEET_ID" ]; then
+            echo "Error: Google Sheets ID is required"
+            exit 1
+        fi
+    else
+        USE_SOURCE_SHEETS="false"
+        read -p "Enter CONFIG_URL (GCS path to csv_config.yaml): " CONFIG_URL
+        read -p "Enter SCHEMA_URL (GCS path to schemas.yaml): " SCHEMA_URL
+        if [ -z "$CONFIG_URL" ] || [ -z "$SCHEMA_URL" ]; then
+            echo "Error: CONFIG_URL and SCHEMA_URL are required"
+            exit 1
+        fi
     fi
-  fi
-  
-  echo "Ensuring bucket gs://${BUCKET} ..."
-  gsutil mb -p "${PROJECT_ID}" -l "${REGION}" "gs://${BUCKET}" 2>/dev/null || true
-  
-  echo "Uploading configs to gs://${BUCKET}/ ..."
-  gsutil cp "${LOCAL_YAML}" "gs://${BUCKET}/${OBJECT_CFG}"
-  gsutil cp "${LOCAL_SCHEMAS}" "gs://${BUCKET}/${OBJECT_SCH}"
-  
-  CONFIG_URL="https://storage.googleapis.com/${BUCKET}/${OBJECT_CFG}"
-  SCHEMA_URL="https://storage.googleapis.com/${BUCKET}/${OBJECT_SCH}"
-  
-  # Set environment variables for YAML
-  ENV_VARS="USE_SOURCE_SHEETS=FALSE,CONFIG_URL=${CONFIG_URL},SCHEMA_URL=${SCHEMA_URL},BQ_LOCATION=${BQ_LOCATION},ALLOW_UNKNOWN_COLUMNS=${ALLOW_UNKNOWN},BATCH_SIZE=5000,CHUNK_SIZE=1048576,DEDUPE_MODE=auto_dedupe,WINDOW_DAYS=30,LOG_LEVEL=INFO"
-fi
+}
 
-echo ""
-echo "Building image ${IMAGE} ..."
-gcloud builds submit --tag "${IMAGE}"
+prompt_allow_unknown_columns() {
+    echo ""
+    echo "Allow unknown columns in CSV files?"
+    echo "  - false (default): Reject CSVs with unknown columns"
+    echo "  - true: Accept and load CSVs with unknown columns"
+    echo ""
+    read -p "Enter choice (true or false) [false]: " choice
+    choice=${choice:-false}
+    ALLOW_UNKNOWN_COLUMNS="$choice"
+}
 
-echo ""
-echo "Deploying Cloud Run service ${SERVICE} ..."
-gcloud run deploy "${SERVICE}" \
-  --image "${IMAGE}" \
-  --region "${REGION}" \
-  --platform managed \
-  --no-allow-unauthenticated \
-  --memory 1Gi \
-  --timeout 900 \
-  --set-env-vars "$ENV_VARS"
+prompt_schema_migration_mode() {
+    echo ""
+    echo "Schema migration strategy:"
+    echo "  1) strict (default): Fail if schema doesn't match"
+    echo "  2) auto_migrate: Add new fields, fail on removals/changes"
+    echo "  3) recreate: Drop and recreate table (DATA LOSS!)"
+    echo ""
+    read -p "Enter choice (1, 2, or 3) [1]: " choice
+    choice=${choice:-1}
+    
+    case $choice in
+        1) SCHEMA_MIGRATION_MODE="strict" ;;
+        2) SCHEMA_MIGRATION_MODE="auto_migrate" ;;
+        3) 
+            echo ""
+            echo "WARNING: 'recreate' mode will DELETE all data in the table!"
+            read -p "Are you sure? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                SCHEMA_MIGRATION_MODE="recreate"
+            else
+                echo "Cancelled. Using 'strict' mode instead."
+                SCHEMA_MIGRATION_MODE="strict"
+            fi
+            ;;
+        *) SCHEMA_MIGRATION_MODE="strict" ;;
+    esac
+}
 
-SERVICE_URL=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')
+validate_inputs() {
+    if [ -z "$PROJECT_ID" ]; then
+        echo "Error: PROJECT_ID not set"
+        exit 1
+    fi
+    
+    if [ "$USE_SOURCE_SHEETS" = "true" ]; then
+        if [ -z "$CONFIG_SHEET_ID" ]; then
+            echo "Error: CONFIG_SHEET_ID is required when using Google Sheets"
+            exit 1
+        fi
+    else
+        if [ -z "$CONFIG_URL" ] || [ -z "$SCHEMA_URL" ]; then
+            echo "Error: CONFIG_URL and SCHEMA_URL are required when using YAML"
+            exit 1
+        fi
+    fi
+}
 
-# Determine runtime service account (explicit or default GCE SA)
-RUNTIME_SA=$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format="value(spec.template.spec.serviceAccountName)")
-if [[ -z "${RUNTIME_SA}" ]]; then
-  PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
-  RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-fi
+enable_apis() {
+    echo ""
+    echo "Enabling required Google Cloud APIs..."
+    gcloud services enable \
+        cloudbuild.googleapis.com \
+        run.googleapis.com \
+        bigquery.googleapis.com \
+        logging.googleapis.com \
+        --project="$PROJECT_ID"
+    
+    if [ "$USE_SOURCE_SHEETS" = "true" ]; then
+        echo "Enabling Google Sheets API for configuration..."
+        gcloud services enable \
+            sheets.googleapis.com \
+            drive.googleapis.com \
+            --project="$PROJECT_ID"
+    fi
+    
+    echo "✓ APIs enabled"
+}
 
-# Grant permissions to runtime service account
-if [[ "$CONFIG_SOURCE" == "2" ]]; then
-  # For Google Sheets: grant Sheets API access
-  echo ""
-  echo "Granting Google Sheets API permissions to service account ${RUNTIME_SA}..."
-  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${RUNTIME_SA}" \
-    --role="roles/editor" \
-    --condition=None >/dev/null 2>&1 || true
-else
-  # For YAML: grant GCS bucket access
-  echo ""
-  echo "Granting GCS bucket access to service account ${RUNTIME_SA}..."
-  gsutil iam ch "serviceAccount:${RUNTIME_SA}:objectViewer" "gs://${BUCKET}"
-fi
+build_and_deploy() {
+    echo ""
+    echo "Building and deploying service..."
+    
+    # Build Docker image
+    gcloud builds submit \
+        --project="$PROJECT_ID" \
+        --tag="gcr.io/$PROJECT_ID/$SERVICE_NAME:latest" \
+        --timeout="3600s" \
+        .
+    
+    # Prepare environment variables
+    ENV_VARS="MULTI_MODE=true"
+    ENV_VARS="$ENV_VARS,BQ_LOCATION=EU"
+    ENV_VARS="$ENV_VARS,ALLOW_UNKNOWN_COLUMNS=$ALLOW_UNKNOWN_COLUMNS"
+    ENV_VARS="$ENV_VARS,SCHEMA_MIGRATION_MODE=$SCHEMA_MIGRATION_MODE"
+    
+    if [ "$USE_SOURCE_SHEETS" = "true" ]; then
+        ENV_VARS="$ENV_VARS,USE_SOURCE_SHEETS=true"
+        ENV_VARS="$ENV_VARS,CONFIG_SHEET_ID=$CONFIG_SHEET_ID"
+    else
+        ENV_VARS="$ENV_VARS,USE_SOURCE_SHEETS=false"
+        ENV_VARS="$ENV_VARS,CONFIG_URL=$CONFIG_URL"
+        ENV_VARS="$ENV_VARS,SCHEMA_URL=$SCHEMA_URL"
+    fi
+    
+    # Deploy to Cloud Run
+    gcloud run deploy "$SERVICE_NAME" \
+        --project="$PROJECT_ID" \
+        --region="$REGION" \
+        --image="gcr.io/$PROJECT_ID/$SERVICE_NAME:latest" \
+        --memory="$MEMORY" \
+        --timeout="$TIMEOUT" \
+        --set-env-vars="$ENV_VARS" \
+        --no-allow-unauthenticated \
+        --platform=managed
+    
+    echo "✓ Service deployed"
+}
 
-# Grant BigQuery permissions to runtime service account
-echo "Granting BigQuery permissions to service account ${RUNTIME_SA}..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${RUNTIME_SA}" \
-  --role="roles/bigquery.dataEditor" \
-  --condition=None >/dev/null 2>&1 || true
+print_summary() {
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  Deployment Summary                                        ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Service Name:              $SERVICE_NAME"
+    echo "Region:                    $REGION"
+    echo "Project:                   $PROJECT_ID"
+    echo ""
+    echo "Configuration:"
+    if [ "$USE_SOURCE_SHEETS" = "true" ]; then
+        echo "  Source:                  Google Sheets"
+        echo "  Sheet ID:                $CONFIG_SHEET_ID"
+    else
+        echo "  Source:                  YAML"
+        echo "  Config URL:              $CONFIG_URL"
+        echo "  Schema URL:              $SCHEMA_URL"
+    fi
+    echo ""
+    echo "Settings:"
+    echo "  Allow Unknown Columns:   $ALLOW_UNKNOWN_COLUMNS"
+    echo "  Schema Migration Mode:   $SCHEMA_MIGRATION_MODE"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Test the service: ./scripts/trigger.sh"
+    echo "  2. View logs: gcloud run logs read $SERVICE_NAME --limit 50"
+    echo "  3. Update env vars: ./scripts/update_env.sh"
+    echo ""
+}
 
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${RUNTIME_SA}" \
-  --role="roles/bigquery.jobUser" \
-  --condition=None >/dev/null 2>&1 || true
+# ======================================================================
+# MAIN
+# ======================================================================
 
-# Persist basic state for helper scripts
-save_state "$PROJECT_ID" "$REGION" "$SERVICE" "$SERVICE_URL"
+main() {
+    print_header
+    
+    echo "Configuration Source Selection:"
+    prompt_configuration_source
+    
+    echo ""
+    echo "Additional Settings:"
+    prompt_allow_unknown_columns
+    prompt_schema_migration_mode
+    
+    echo ""
+    echo "Validating inputs..."
+    validate_inputs
+    
+    echo ""
+    echo "Summary of deployment:"
+    echo "  Project:                 $PROJECT_ID"
+    echo "  Service:                 $SERVICE_NAME"
+    echo "  Region:                  $REGION"
+    if [ "$USE_SOURCE_SHEETS" = "true" ]; then
+        echo "  Config Source:           Google Sheets ($CONFIG_SHEET_ID)"
+    else
+        echo "  Config Source:           YAML"
+    fi
+    echo "  Allow Unknown Columns:   $ALLOW_UNKNOWN_COLUMNS"
+    echo "  Schema Migration Mode:   $SCHEMA_MIGRATION_MODE"
+    echo ""
+    read -p "Proceed with deployment? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        echo "Deployment cancelled."
+        exit 0
+    fi
+    
+    enable_apis
+    build_and_deploy
+    print_summary
+}
 
-echo ""
-echo "✅ Deployed"
-echo "Service URL:   $SERVICE_URL"
-if [[ "$CONFIG_SOURCE" == "2" ]]; then
-  echo "Config Source: Google Sheets (ID: $SHEET_ID)"
-else
-  echo "CONFIG_URL:    $CONFIG_URL"
-  echo "SCHEMA_URL:    $SCHEMA_URL"
-fi
-echo ""
-echo "First run:"
-echo "  ./scripts/trigger.sh"
+main "$@"

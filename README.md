@@ -529,6 +529,42 @@ To update environment variables on a deployed service without redeploying, use t
 ./scripts/teardown.sh
 ```
 
+## Schema Validation and Migration
+
+The service now includes a schema validation and migration strategy to handle changes to your BigQuery table schemas. This is controlled by the `SCHEMA_MIGRATION_MODE` environment variable.
+
+**strict** - (default) always return errors when changing schema, requires action (like creating a new table)
+
+**auto_migrate** - adds new columns safely, but returns errors when removing or changing existing ones
+
+**recreate** - recreates the table anytime the schema is changed
+
+### How to Set
+
+**During deployment:**
+
+The `deploy_multi.sh` script will prompt you to choose the schema migration mode during deployment.
+
+**On a deployed service:**
+
+You can update the `SCHEMA_MIGRATION_MODE` on a deployed service without redeploying using the `update_env.sh` script:
+
+```bash
+# Interactive mode
+./scripts/update_env.sh
+```
+
+```bash
+# Command-line mode
+./scripts/update_env.sh --set SCHEMA_MIGRATION_MODE=auto_migrate
+```
+
+### Recommendations
+
+- **Production:** Use `strict` mode to prevent accidental schema changes.
+- **Development:** Use `auto_migrate` or `recreate` to iterate quickly.
+- **Always back up your data** before making significant schema changes.
+
 ---
 
 ## 📊 Verify BigQuery Data

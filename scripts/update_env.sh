@@ -1,264 +1,267 @@
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."  # ensure repo root
+#!/bin/bash
+# Update environment variables on a deployed Cloud Run service
+# Supports updating: ALLOW_UNKNOWN_COLUMNS, USE_SOURCE_SHEETS, SCHEMA_MIGRATION_MODE, and others
 
-# shellcheck disable=SC1091
-. scripts/common.sh
+set -e
 
-# Update Environment Variables on Deployed Service
-#
-# This script allows you to update environment variables on an already-deployed
-# Cloud Run service without redeploying the entire service.
-#
-# Supported variables:
-#   - ALLOW_UNKNOWN_COLUMNS: true/false (skip unknown CSV columns)
-#   - USE_SOURCE_SHEETS: TRUE/FALSE (switch between Google Sheets and YAML config)
-#   - CONFIG_SHEET_ID: Google Sheets ID (when using Google Sheets)
-#   - LOG_LEVEL: DEBUG/INFO/WARNING/ERROR
-#   - BATCH_SIZE: Rows per batch for BigQuery load
-#   - CHUNK_SIZE: Bytes per chunk for HTTP streaming
-#   - DEDUPE_MODE: no_dedupe/auto_dedupe/full_dedupe
-#   - WINDOW_DAYS: Days to retain for non-empty tables
-#
-# Usage:
-#   ./scripts/update_env.sh
-#   ./scripts/update_env.sh --allow-unknown true
-#   ./scripts/update_env.sh --use-sheets true --sheet-id YOUR_SHEET_ID
-#   ./scripts/update_env.sh --log-level DEBUG
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
 
-load_state
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+SERVICE_NAME="${SERVICE_NAME:-csv-bq-multi}"
+REGION="${REGION:-europe-west1}"
 
-PROJECT_ID=${PROJECT_ID:-$(active_project)}
-REGION=${REGION:-europe-west1}
-SERVICE=${SERVICE:-csv-bq-multi}
+# ======================================================================
+# FUNCTIONS
+# ======================================================================
 
-echo "== Update Environment Variables =="
-echo ""
-echo "Service: $SERVICE"
-echo "Region: $REGION"
-echo ""
+print_header() {
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  Update Cloud Run Service Environment Variables            ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+}
 
-# Parse command-line arguments
-ALLOW_UNKNOWN=""
-USE_SHEETS=""
-SHEET_ID=""
-LOG_LEVEL=""
-BATCH_SIZE=""
-CHUNK_SIZE=""
-DEDUPE_MODE=""
-WINDOW_DAYS=""
+show_current_env() {
+    echo "Current environment variables:"
+    echo ""
+    gcloud run services describe "$SERVICE_NAME" \
+        --region="$REGION" \
+        --project="$PROJECT_ID" \
+        --format="table(spec.template.spec.containers[].env[].name,spec.template.spec.containers[].env[].value)" \
+        || echo "Error: Could not retrieve current environment variables"
+    echo ""
+}
 
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --allow-unknown)
-      ALLOW_UNKNOWN="$2"
-      shift 2
-      ;;
-    --use-sheets)
-      USE_SHEETS="$2"
-      shift 2
-      ;;
-    --sheet-id)
-      SHEET_ID="$2"
-      shift 2
-      ;;
-    --log-level)
-      LOG_LEVEL="$2"
-      shift 2
-      ;;
-    --batch-size)
-      BATCH_SIZE="$2"
-      shift 2
-      ;;
-    --chunk-size)
-      CHUNK_SIZE="$2"
-      shift 2
-      ;;
-    --dedupe-mode)
-      DEDUPE_MODE="$2"
-      shift 2
-      ;;
-    --window-days)
-      WINDOW_DAYS="$2"
-      shift 2
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
-  esac
-done
+get_current_env_vars() {
+    gcloud run services describe "$SERVICE_NAME" \
+        --region="$REGION" \
+        --project="$PROJECT_ID" \
+        --format="json" | \
+        jq -r '.spec.template.spec.containers[0].env[] | "\(.name)=\(.value)"' 2>/dev/null || echo ""
+}
 
-# If no arguments provided, use interactive mode
-if [[ -z "$ALLOW_UNKNOWN" && -z "$USE_SHEETS" && -z "$LOG_LEVEL" && -z "$BATCH_SIZE" && -z "$CHUNK_SIZE" && -z "$DEDUPE_MODE" && -z "$WINDOW_DAYS" ]]; then
-  echo "Select which variables to update:"
-  echo ""
-  echo "1) ALLOW_UNKNOWN_COLUMNS (skip unknown CSV columns)"
-  echo "2) USE_SOURCE_SHEETS (switch between Google Sheets and YAML)"
-  echo "3) LOG_LEVEL (change logging level)"
-  echo "4) BATCH_SIZE (rows per batch for BigQuery)"
-  echo "5) CHUNK_SIZE (bytes per chunk for HTTP streaming)"
-  echo "6) DEDUPE_MODE (deduplication mode)"
-  echo "7) WINDOW_DAYS (days to retain for non-empty tables)"
-  echo "8) View current environment variables"
-  echo ""
-  
-  CHOICE=$(prompt_default "Select option (1-8)" "1")
-  
-  case $CHOICE in
-    1)
-      ALLOW_UNKNOWN=$(prompt_default "ALLOW_UNKNOWN_COLUMNS (true/false)" "false")
-      ;;
-    2)
-      USE_SHEETS=$(prompt_default "USE_SOURCE_SHEETS (TRUE/FALSE)" "FALSE")
-      if [[ "$USE_SHEETS" == "TRUE" ]]; then
-        SHEET_ID=$(prompt_default "CONFIG_SHEET_ID" "")
-        if [[ -z "$SHEET_ID" ]]; then
-          echo "❌ Sheet ID is required when enabling Google Sheets"
-          exit 1
+update_single_var() {
+    local var_name="$1"
+    local var_value="$2"
+    
+    echo "Updating $var_name to: $var_value"
+    
+    # Get current env vars
+    local current_vars=$(get_current_env_vars)
+    
+    # Build new env vars string
+    local new_vars=""
+    local found=false
+    
+    while IFS= read -r line; do
+        if [ -z "$line" ]; then
+            continue
         fi
-      fi
-      ;;
-    3)
-      LOG_LEVEL=$(prompt_default "LOG_LEVEL (DEBUG/INFO/WARNING/ERROR)" "INFO")
-      ;;
-    4)
-      BATCH_SIZE=$(prompt_default "BATCH_SIZE (rows per batch)" "5000")
-      ;;
-    5)
-      CHUNK_SIZE=$(prompt_default "CHUNK_SIZE (bytes per chunk)" "1048576")
-      ;;
-    6)
-      DEDUPE_MODE=$(prompt_default "DEDUPE_MODE (no_dedupe/auto_dedupe/full_dedupe)" "auto_dedupe")
-      ;;
-    7)
-      WINDOW_DAYS=$(prompt_default "WINDOW_DAYS (days to retain)" "30")
-      ;;
-    8)
-      echo "Current environment variables:"
-      gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT_ID" \
-        --format="table(spec.template.spec.containers[0].env[].name,spec.template.spec.containers[0].env[].value)"
-      exit 0
-      ;;
-    *)
-      echo "❌ Invalid option"
-      exit 1
-      ;;
-  esac
-fi
+        
+        local key="${line%%=*}"
+        if [ "$key" = "$var_name" ]; then
+            new_vars="$new_vars$var_name=$var_value"
+            found=true
+        else
+            new_vars="$new_vars$line"
+        fi
+        new_vars="$new_vars,"
+    done <<< "$current_vars"
+    
+    # If variable not found, add it
+    if [ "$found" = false ]; then
+        new_vars="$new_vars$var_name=$var_value,"
+    fi
+    
+    # Remove trailing comma
+    new_vars="${new_vars%,}"
+    
+    # Update service
+    gcloud run services update "$SERVICE_NAME" \
+        --region="$REGION" \
+        --project="$PROJECT_ID" \
+        --set-env-vars="$new_vars" \
+        --quiet
+    
+    echo "✓ $var_name updated successfully"
+}
 
-# Fetch current environment variables
-echo "Fetching current environment variables..."
-CURRENT_ENV=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT_ID" \
-  --format=json | jq -r '.spec.template.spec.containers[0].env | map("\(.name)=\(.value)") | join(",")')
+interactive_mode() {
+    echo "Select variable to update:"
+    echo ""
+    echo "1) ALLOW_UNKNOWN_COLUMNS (accept CSVs with unknown columns)"
+    echo "2) USE_SOURCE_SHEETS (switch between YAML and Google Sheets)"
+    echo "3) SCHEMA_MIGRATION_MODE (schema change handling strategy)"
+    echo "4) LOG_LEVEL (logging verbosity)"
+    echo "5) BATCH_SIZE (rows per batch)"
+    echo "6) DEDUPE_MODE (deduplication strategy)"
+    echo "7) WINDOW_DAYS (days to keep in window mode)"
+    echo "8) Custom variable"
+    echo ""
+    read -p "Enter choice (1-8): " choice
+    
+    case $choice in
+        1)
+            echo ""
+            echo "Current ALLOW_UNKNOWN_COLUMNS:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='ALLOW_UNKNOWN_COLUMNS'].value)" || echo "Not set"
+            echo ""
+            echo "Options: true, false"
+            read -p "Enter value: " value
+            update_single_var "ALLOW_UNKNOWN_COLUMNS" "$value"
+            ;;
+        2)
+            echo ""
+            echo "Current USE_SOURCE_SHEETS:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='USE_SOURCE_SHEETS'].value)" || echo "Not set"
+            echo ""
+            echo "Options: true (Google Sheets), false (YAML)"
+            read -p "Enter value: " value
+            update_single_var "USE_SOURCE_SHEETS" "$value"
+            
+            if [ "$value" = "true" ]; then
+                read -p "Enter CONFIG_SHEET_ID: " sheet_id
+                update_single_var "CONFIG_SHEET_ID" "$sheet_id"
+            fi
+            ;;
+        3)
+            echo ""
+            echo "Current SCHEMA_MIGRATION_MODE:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='SCHEMA_MIGRATION_MODE'].value)" || echo "Not set"
+            echo ""
+            echo "Options:"
+            echo "  strict: Fail if schema doesn't match (default)"
+            echo "  auto_migrate: Add new fields, fail on removals/changes"
+            echo "  recreate: Drop and recreate table (DATA LOSS!)"
+            read -p "Enter value: " value
+            
+            if [ "$value" = "recreate" ]; then
+                echo ""
+                echo "WARNING: 'recreate' mode will DELETE all data in the table!"
+                read -p "Are you sure? (yes/no): " confirm
+                if [ "$confirm" != "yes" ]; then
+                    echo "Cancelled."
+                    return
+                fi
+            fi
+            
+            update_single_var "SCHEMA_MIGRATION_MODE" "$value"
+            ;;
+        4)
+            echo ""
+            echo "Current LOG_LEVEL:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='LOG_LEVEL'].value)" || echo "Not set"
+            echo ""
+            echo "Options: DEBUG, INFO, WARNING, ERROR"
+            read -p "Enter value: " value
+            update_single_var "LOG_LEVEL" "$value"
+            ;;
+        5)
+            echo ""
+            echo "Current BATCH_SIZE:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='BATCH_SIZE'].value)" || echo "Not set"
+            echo ""
+            read -p "Enter value (default 5000): " value
+            value=${value:-5000}
+            update_single_var "BATCH_SIZE" "$value"
+            ;;
+        6)
+            echo ""
+            echo "Current DEDUPE_MODE:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='DEDUPE_MODE'].value)" || echo "Not set"
+            echo ""
+            echo "Options: no_dedupe, auto_dedupe, full_dedupe"
+            read -p "Enter value: " value
+            update_single_var "DEDUPE_MODE" "$value"
+            ;;
+        7)
+            echo ""
+            echo "Current WINDOW_DAYS:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='WINDOW_DAYS'].value)" || echo "Not set"
+            echo ""
+            read -p "Enter value (default 30): " value
+            value=${value:-30}
+            update_single_var "WINDOW_DAYS" "$value"
+            ;;
+        8)
+            read -p "Enter variable name: " var_name
+            read -p "Enter variable value: " var_value
+            update_single_var "$var_name" "$var_value"
+            ;;
+        *)
+            echo "Invalid choice"
+            return 1
+            ;;
+    esac
+}
 
-# Parse current environment into an associative array
-declare -A ENV_MAP
-IFS=',' read -ra ENV_PAIRS <<< "$CURRENT_ENV"
-for pair in "${ENV_PAIRS[@]}"; do
-  if [[ -n "$pair" ]]; then
-    key="${pair%%=*}"
-    value="${pair#*=}"
-    ENV_MAP["$key"]="$value"
-  fi
-done
+# ======================================================================
+# MAIN
+# ======================================================================
 
-# Update environment variables
-if [[ -n "$ALLOW_UNKNOWN" ]]; then
-  ENV_MAP["ALLOW_UNKNOWN_COLUMNS"]="$ALLOW_UNKNOWN"
-fi
+main() {
+    print_header
+    
+    # Check if arguments provided
+    if [ $# -eq 0 ]; then
+        # Interactive mode
+        show_current_env
+        interactive_mode
+    else
+        # Command-line mode
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --list)
+                    show_current_env
+                    shift
+                    ;;
+                --set)
+                    shift
+                    if [ $# -lt 1 ]; then
+                        echo "Error: --set requires a value (VAR=VALUE)"
+                        exit 1
+                    fi
+                    var_assignment="$1"
+                    var_name="${var_assignment%%=*}"
+                    var_value="${var_assignment#*=}"
+                    update_single_var "$var_name" "$var_value"
+                    shift
+                    ;;
+                *)
+                    echo "Unknown option: $1"
+                    echo "Usage: $0 [--list] [--set VAR=VALUE]"
+                    exit 1
+                    ;;
+            esac
+        done
+    fi
+    
+    echo ""
+    echo "✓ Done"
+}
 
-if [[ -n "$USE_SHEETS" ]]; then
-  ENV_MAP["USE_SOURCE_SHEETS"]="$USE_SHEETS"
-  if [[ "$USE_SHEETS" == "TRUE" && -n "$SHEET_ID" ]]; then
-    ENV_MAP["CONFIG_SHEET_ID"]="$SHEET_ID"
-    # Remove YAML-specific variables if switching to Sheets
-    unset 'ENV_MAP[CONFIG_URL]'
-    unset 'ENV_MAP[SCHEMA_URL]'
-  elif [[ "$USE_SHEETS" == "FALSE" ]]; then
-    # Remove Sheets-specific variables if switching to YAML
-    unset 'ENV_MAP[CONFIG_SHEET_ID]'
-  fi
-fi
-
-if [[ -n "$LOG_LEVEL" ]]; then
-  ENV_MAP["LOG_LEVEL"]="$LOG_LEVEL"
-fi
-
-if [[ -n "$BATCH_SIZE" ]]; then
-  ENV_MAP["BATCH_SIZE"]="$BATCH_SIZE"
-fi
-
-if [[ -n "$CHUNK_SIZE" ]]; then
-  ENV_MAP["CHUNK_SIZE"]="$CHUNK_SIZE"
-fi
-
-if [[ -n "$DEDUPE_MODE" ]]; then
-  ENV_MAP["DEDUPE_MODE"]="$DEDUPE_MODE"
-fi
-
-if [[ -n "$WINDOW_DAYS" ]]; then
-  ENV_MAP["WINDOW_DAYS"]="$WINDOW_DAYS"
-fi
-
-# Build the environment variables string
-ENV_VARS=""
-for key in "${!ENV_MAP[@]}"; do
-  if [[ -z "$ENV_VARS" ]]; then
-    ENV_VARS="${key}=${ENV_MAP[$key]}"
-  else
-    ENV_VARS="${ENV_VARS},${key}=${ENV_MAP[$key]}"
-  fi
-done
-
-# Show what will be updated
-echo ""
-echo "📋 Changes to be applied:"
-echo ""
-if [[ -n "$ALLOW_UNKNOWN" ]]; then
-  echo "  ALLOW_UNKNOWN_COLUMNS: ${ENV_MAP[ALLOW_UNKNOWN_COLUMNS]}"
-fi
-if [[ -n "$USE_SHEETS" ]]; then
-  echo "  USE_SOURCE_SHEETS: ${ENV_MAP[USE_SOURCE_SHEETS]}"
-  if [[ -n "$SHEET_ID" ]]; then
-    echo "  CONFIG_SHEET_ID: ${ENV_MAP[CONFIG_SHEET_ID]}"
-  fi
-fi
-if [[ -n "$LOG_LEVEL" ]]; then
-  echo "  LOG_LEVEL: ${ENV_MAP[LOG_LEVEL]}"
-fi
-if [[ -n "$BATCH_SIZE" ]]; then
-  echo "  BATCH_SIZE: ${ENV_MAP[BATCH_SIZE]}"
-fi
-if [[ -n "$CHUNK_SIZE" ]]; then
-  echo "  CHUNK_SIZE: ${ENV_MAP[CHUNK_SIZE]}"
-fi
-if [[ -n "$DEDUPE_MODE" ]]; then
-  echo "  DEDUPE_MODE: ${ENV_MAP[DEDUPE_MODE]}"
-fi
-if [[ -n "$WINDOW_DAYS" ]]; then
-  echo "  WINDOW_DAYS: ${ENV_MAP[WINDOW_DAYS]}"
-fi
-echo ""
-
-read -rp "Apply changes? (Y/N): " CONFIRM
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-  echo "❌ Cancelled"
-  exit 1
-fi
-
-# Update the service
-echo ""
-echo "Updating Cloud Run service..."
-gcloud run services update "$SERVICE" \
-  --region "$REGION" \
-  --project "$PROJECT_ID" \
-  --set-env-vars "$ENV_VARS" \
-  --quiet
-
-echo ""
-echo "✅ Environment variables updated"
-echo ""
-echo "Updated variables:"
-gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT_ID" \
-  --format="table(spec.template.spec.containers[0].env[].name,spec.template.spec.containers[0].env[].value)"
+main "$@"
