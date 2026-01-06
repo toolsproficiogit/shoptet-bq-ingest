@@ -6,11 +6,15 @@ requests==2.31.0
 urllib3==2.1.0
 
 # YAML config support
-PyYAML==6.0.1
+pyyaml>=6.0
+
+# Google Sheets config support
+gspread>=5.10.0
+oauth2client>=4.1.3
 
 # Google Cloud clients
-google-cloud-bigquery==3.15.0
-google-cloud-storage==2.14.0
+google-cloud-storage>=2.0.0
+google-cloud-bigquery>=3.0.0
 google-api-core==2.17.0
 
 # Optional: ensures CSV parsing always works
