@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Grant all required roles (including Cloud Storage) to a deploying user.
+# Grant all required roles to a deploying user.
+# 
+# This includes permissions for:
+#   - Cloud Run deployment and management
+#   - BigQuery operations
+#   - Cloud Storage (YAML configs)
+#   - Google Sheets (configuration source)
+#   - Cloud Scheduler (scheduling)
+#   - IAM and service account management
+#   - Cloud Build and Artifact Registry
+#
 # Usage:
 #   PROJECT_ID="my-project" USER_EMAIL="user@example.com" ./scripts/grant_permissions.sh
 
@@ -12,14 +22,16 @@ if [[ -z "${PROJECT_ID:-}" || -z "${USER_EMAIL:-}" ]]; then
 fi
 
 ROLES=(
-  roles/run.admin
-  roles/cloudscheduler.admin
-  roles/iam.serviceAccountAdmin
-  roles/iam.serviceAccountUser
-  roles/cloudbuild.builds.editor
-  roles/artifactregistry.admin
-  roles/serviceusage.serviceUsageAdmin
-  roles/storage.admin
+  roles/run.admin                      # Deploy and manage Cloud Run services
+  roles/cloudscheduler.admin           # Create and manage scheduled jobs
+  roles/iam.serviceAccountAdmin        # Create and manage service accounts
+  roles/iam.serviceAccountUser         # Allow using service accounts in deploys
+  roles/cloudbuild.builds.editor       # Build and push Docker images
+  roles/artifactregistry.admin         # Create and manage Artifact Registry repositories
+  roles/serviceusage.serviceUsageAdmin # Enable required APIs
+  roles/storage.admin                  # Create buckets & upload YAML (remote config)
+  roles/bigquery.admin                 # BigQuery operations (for testing/validation)
+  roles/editor                         # For Google Sheets API access (alternative: roles/sheets.editor if available)
 )
 
 echo "Granting roles to user ${USER_EMAIL} on project ${PROJECT_ID}..."
@@ -40,4 +52,4 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --role="roles/artifactregistry.writer" \
   --condition=None >/dev/null
 
-echo "All roles granted."
+echo "✅ All roles granted."
