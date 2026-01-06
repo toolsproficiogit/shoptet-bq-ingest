@@ -146,7 +146,7 @@ The script will prompt you to choose your configuration source and guide you thr
 ### Google Sheets: `Pipeline_Config` Tab
 
 | pipeline_id | export_type | csv_url | bq_table_id | delimiter | encoding | skip_leading_rows | load_mode | window_days | dedupe_mode | timeout_sec | retries | active |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | pipe_1 | orders | https://... | project.dataset.table | ; | utf-8 | 1 | auto | 30 | auto_dedupe | 300 | 3 | TRUE |
 
 ### Google Sheets: `Schema_Config` Tab
