@@ -103,11 +103,10 @@ Choose one of the following configuration sources:
 2. **Populate the tabs** with your configuration data (see templates below).
 3. **Get your service account email:**
 
-   ```bash
-   PROJECT_ID="$(gcloud config get-value project)"
-   SERVICE_ACCOUNT_NAME="csv-bq-ingest"
-   echo "${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-   ```
+```bash
+PROJECT_NUMBER=$(gcloud projects describe $(gcloud config get-value project) --format='value(projectNumber)')
+echo "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+```
 
 4. **Share the sheet** with this email address and give it **Editor** permissions.
 

@@ -56,14 +56,22 @@ DEFAULT_DEDUPE_MODE = "auto_dedupe"
 # ======================================================================
 
 def decimal_comma_to_float(s: Optional[str]) -> Optional[float]:
-    """Parse decimal number with comma as decimal separator (European format)."""
+    """Parse decimal number with comma as decimal separator (Czech Shoptet format).
+    
+    Shoptet CSV uses comma as decimal separator with NO thousands separator.
+    Examples: 3021,29 -> 3021.29, 8,54 -> 8.54, 1585 -> 1585.0
+    """
     if s is None:
         return None
+    
     s = str(s).strip().strip('"').strip("'")
     if s == "" or s.lower() in {"na", "nan", "null"}:
         return None
-    # Replace . with empty and , with . to convert to standard float format
-    normalized = s.replace(".", "").replace(",", ".")
+    
+    # Simple approach: just replace comma with dot
+    # Shoptet format NEVER has thousands separators
+    normalized = s.replace(",", ".")
+    
     try:
         return float(normalized)
     except ValueError:
@@ -146,7 +154,12 @@ def build_row_from_record(
         # Apply parser to the source field value
         if source:
             raw_value = rec.get(source)
-            row[name] = parser(raw_value)
+            parsed_value = parser(raw_value)
+            row[name] = parsed_value
+            
+            # Debug logging for decimal_comma fields
+            if parser_key == "decimal_comma" and raw_value and parsed_value is not None:
+                log.debug(f"Pipeline {pipeline_id}: Field {name} - raw={raw_value} -> parsed={parsed_value}")
         else:
             # No source means this is a computed/generated field
             row[name] = None
@@ -481,6 +494,14 @@ def load_to_staging_batched(
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         json_rows = _coerce_for_json(batch, schema_def=schema_def)
+        
+        # Debug logging for first row
+        if i == 0 and json_rows:
+            first_row = json_rows[0]
+            for key, value in first_row.items():
+                if isinstance(value, float):
+                    log.debug(f"Staging load - Field {key}: {value} (type: {type(value).__name__})")
+        
         job = bq.load_table_from_json(
             json_rows, 
             staging, 
@@ -677,6 +698,11 @@ class GoogleSheetsConfigProvider(ConfigProvider):
                 if export_type:
                     if export_type not in schemas:
                         schemas[export_type] = []
+                    
+                    # Map parse_logic to parse for compatibility
+                    if "parse_logic" in record and "parse" not in record:
+                        record["parse"] = record.pop("parse_logic")
+                    
                     schemas[export_type].append(record)
             
             return schemas
@@ -713,11 +739,13 @@ def process_pipeline(
     migration_mode: str = "strict",
 ) -> Dict[str, Any]:
     """Process a single pipeline with error isolation."""
-    pipeline_id = p.get("id") or "unknown"
+    # Try multiple field names for pipeline ID
+    pipeline_id = p.get("id") or p.get("pipeline_id") or p.get("name") or p.get("export_type") or "unknown"
     csv_url = p.get("csv_url")
     table_id = p.get("bq_table_id")
     
     if not csv_url or not table_id:
+        log.warning(f"Pipeline {pipeline_id}: Missing csv_url or bq_table_id. Pipeline dict keys: {list(p.keys())}")
         return {
             "pipeline": pipeline_id,
             "status": "error",
@@ -767,6 +795,7 @@ def process_pipeline(
         
         # Parse CSV and build rows using schema parsers
         rows = []
+        filtered_count = 0
         try:
             reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
             for csv_record in reader:
@@ -778,14 +807,37 @@ def process_pipeline(
                 
                 # Filter by window if needed
                 if effective_mode == "window":
-                    dt = row.get("date")
+                    # Find the date field (could be named 'date' or other timestamp field)
+                    dt = None
+                    for field_def in schema_def:
+                        if field_def.get("type") in {"TIMESTAMP", "DATE", "DATETIME"}:
+                            field_name = field_def.get("name")
+                            if field_name in row:
+                                dt = row.get(field_name)
+                                break
+                    
                     if dt:
                         if isinstance(dt, datetime):
                             cutoff = datetime.now() - timedelta(days=window_days)
                             if dt < cutoff:
+                                filtered_count += 1
                                 continue
+                        elif isinstance(dt, str):
+                            # Try to parse if it's still a string
+                            try:
+                                dt_obj = parse_datetime(dt)
+                                if dt_obj:
+                                    cutoff = datetime.now() - timedelta(days=window_days)
+                                    if dt_obj < cutoff:
+                                        filtered_count += 1
+                                        continue
+                            except:
+                                pass
                 
                 rows.append(row)
+            
+            if effective_mode == "window" and filtered_count > 0:
+                log.info(f"Pipeline {pipeline_id}: Filtered out {filtered_count} rows older than {window_days} days")
         
         except Exception as e:
             log.exception("Failed to parse CSV for pipeline %s: %s", pipeline_id, e)
@@ -797,12 +849,13 @@ def process_pipeline(
             }
         
         if not rows:
+            log.info(f"Pipeline {pipeline_id}: No rows to load after filtering (mode={effective_mode}, window_days={window_days})")
             return {
                 "pipeline": pipeline_id,
                 "table": table_id,
                 "status": "success",
                 "rows_loaded": 0,
-                "message": "No rows to load",
+                "message": f"No rows to load (filtered {filtered_count} old rows)" if effective_mode == "window" else "No rows to load",
             }
         
         # Apply deduplication
@@ -825,11 +878,15 @@ def process_pipeline(
         # Merge staging to target
         merge_staging(bq_cli, staging, table_id, dedupe_mode, BQ_LOCATION)
         
+        rows_count = len(rows)
+        log.info(f"Pipeline {pipeline_id}: Successfully loaded {rows_count} rows (mode={effective_mode}, filtered {filtered_count} old rows)")
+        
         return {
             "pipeline": pipeline_id,
             "table": table_id,
             "status": "success",
-            "rows_loaded": len(rows),
+            "rows_loaded": rows_count,
+            "rows_filtered": filtered_count if effective_mode == "window" else 0,
         }
     
     except Exception as e:
