@@ -335,6 +335,14 @@ Number of times to retry downloading the CSV if the download fails. Each retry u
 
 Whether this pipeline should be executed. Set to `FALSE` to temporarily disable a pipeline without deleting it. This field is only used in Google Sheets.
 
+### `key_fields` (Optional, Google Sheets only)
+
+**Type:** Comma-separated field names  
+**Default:** Auto-detected (looks for id, product_id, order_id, customer_id, sku)  
+**Example:** `date,email,code`
+
+Controls deduplication logic; when multiple rows have the same key combination, only the last occurrence is kept. Make sure all the key fields are configured in the Schema.
+
 ---
 
 ## Schema Configuration Fields
