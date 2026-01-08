@@ -439,15 +439,17 @@ def apply_dedupe(
         return rows
     
     if dedupe_mode == "full_dedupe":
-        # Remove completely identical rows
-        seen = set()
-        result = []
+        # For full_dedupe: keep only the LAST occurrence of each key
+        # This is important for MERGE to work (one source row per target row)
+        if not key_fields:
+            key_fields = _choose_keys(list(rows[0].keys()) if rows else [])
+        
+        seen = {}
         for row in rows:
-            row_tuple = tuple(sorted(row.items()))
-            if row_tuple not in seen:
-                seen.add(row_tuple)
-                result.append(row)
-        return result
+            key_val = tuple(row.get(k) for k in key_fields)
+            seen[key_val] = row  # Keep last occurrence
+        
+        return list(seen.values())
     
     if dedupe_mode == "auto_dedupe":
         # Remove duplicates based on key fields
@@ -522,6 +524,7 @@ def merge_staging(
     target_table: str,
     dedupe_mode: str,
     location: str,
+    key_fields: Optional[Tuple[str, ...]] = None,
 ) -> int:
     """
     Merge staging table to target using MERGE statement.
@@ -537,15 +540,30 @@ def merge_staging(
         staging_fields = [f.name for f in stg.schema]
         
         # Determine key fields for MERGE (id, product_id, order_id, etc.)
-        key_fields = _choose_keys(target_fields)
+        # Use configured key_fields if provided, otherwise auto-detect
+        if not key_fields:
+            key_fields = _choose_keys(target_fields)
         key_set = set(key_fields)
+        
+        log.info("Using key fields for MERGE: %s", key_fields)
         
         # Common fields (excluding keys) to update
         common_fields = [f for f in target_fields if f in staging_fields and f not in key_set]
         
-        # Build MERGE statement
+        # Build MERGE statement with defensive deduplication
+        # Use ROW_NUMBER to keep only the LAST occurrence of each key in staging
         select_cols = list(key_fields) + common_fields
         select_sql = ", ".join(select_cols)
+        
+        # Add ROW_NUMBER to deduplicate by key, keeping the last row
+        row_num_partition = ", ".join(key_fields) if key_fields else "1"
+        dedup_sql = f"""SELECT {select_sql}
+        FROM (
+            SELECT {select_sql},
+                   ROW_NUMBER() OVER (PARTITION BY {row_num_partition} ORDER BY 1 DESC) as rn
+            FROM `{staging_table}`
+        )
+        WHERE rn = 1"""
         
         # UPDATE clause: set all common fields
         update_sets = ", ".join([f"T.{f} = S.{f}" for f in common_fields]) if common_fields else ""
@@ -561,7 +579,7 @@ def merge_staging(
         
         query = f"""
         MERGE `{target_table}` T
-        USING (SELECT {select_sql} FROM `{staging_table}`) S
+        USING ({dedup_sql}) S
         ON {on_clause}
         {update_clause}
         WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({insert_values});
@@ -583,6 +601,43 @@ def merge_staging(
             log.warning("Failed to delete staging table %s: %s", staging_table, e)
     
     return 0
+
+
+def extract_key_fields(
+    pipeline_cfg: Dict[str, Any],
+    schema_lib: Dict[str, List[Dict[str, Any]]],
+) -> Optional[Tuple[str, ...]]:
+    """
+    Extract key fields from pipeline config or schema library.
+    Key fields are used for deduplication and MERGE operations.
+    Format: comma-separated field names (e.g., "id,product_id" or "order_id,line_item_id")
+    """
+    # First check if key_fields is specified in pipeline config
+    if pipeline_cfg.get("key_fields"):
+        key_str = pipeline_cfg.get("key_fields")
+        if isinstance(key_str, str):
+            fields = tuple(f.strip() for f in key_str.split(",") if f.strip())
+            if fields:
+                log.info("Using configured key fields: %s", fields)
+                return fields
+    
+    # Then check schema library for key_fields attribute
+    export_type = pipeline_cfg.get("export_type")
+    if export_type and export_type in schema_lib:
+        schema_list = schema_lib[export_type]
+        if schema_list and isinstance(schema_list, list) and len(schema_list) > 0:
+            first_schema = schema_list[0]
+            if isinstance(first_schema, dict) and first_schema.get("key_fields"):
+                key_str = first_schema.get("key_fields")
+                if isinstance(key_str, str):
+                    fields = tuple(f.strip() for f in key_str.split(",") if f.strip())
+                    if fields:
+                        log.info("Using key fields from schema library: %s", fields)
+                        return fields
+    
+    # No explicit key fields configured
+    log.debug("No explicit key_fields configured for pipeline %s", pipeline_cfg.get("id"))
+    return None
 
 
 def schema_from_config(
@@ -858,10 +913,15 @@ def process_pipeline(
                 "message": f"No rows to load (filtered {filtered_count} old rows)" if effective_mode == "window" else "No rows to load",
             }
         
+        # Extract configured key fields for this pipeline
+        configured_keys = extract_key_fields(p, schema_lib)
+        
         # Apply deduplication
         if dedupe_mode != "no_dedupe":
-            key_fields = _choose_keys(list(rows[0].keys()) if rows else [])
+            # Use configured key fields if available, otherwise auto-detect
+            key_fields = configured_keys or _choose_keys(list(rows[0].keys()) if rows else [])
             rows = apply_dedupe(rows, dedupe_mode, key_fields)
+            log.info("Pipeline %s: Applied %s deduplication with key fields: %s", pipeline_id, dedupe_mode, key_fields)
         
         # Load to staging
         staging = load_to_staging_batched(bq_cli, rows, table_id, bq_fields, BQ_LOCATION, schema_def=schema_def)
@@ -875,8 +935,8 @@ def process_pipeline(
                 "message": "No rows to load",
             }
         
-        # Merge staging to target
-        merge_staging(bq_cli, staging, table_id, dedupe_mode, BQ_LOCATION)
+        # Merge staging to target with configured key fields
+        merge_staging(bq_cli, staging, table_id, dedupe_mode, BQ_LOCATION, key_fields=configured_keys)
         
         rows_count = len(rows)
         log.info(f"Pipeline {pipeline_id}: Successfully loaded {rows_count} rows (mode={effective_mode}, filtered {filtered_count} old rows)")
@@ -905,6 +965,7 @@ def process_pipeline(
 # ======================================================================
 
 @app.route("/", methods=["GET", "POST"])
+@app.route("/run", methods=["GET", "POST"])
 def trigger():
     """HTTP endpoint for Cloud Run trigger."""
     try:
