@@ -7,9 +7,10 @@ It includes comprehensive validation and support for all configuration options.
 Expected Sheet Structure:
 
 Pipeline_Config tab:
-  | pipeline_id | export_type | csv_url | bq_table_id | write_disposition | delimiter | encoding | skip_leading_rows | load_mode | window_days | dedupe_mode | timeout_sec | retries | active |
-  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-  | pipe_1 | orders | https://... | project.dataset.table | WRITE_APPEND | ; | utf-8 | 1 | auto | 30 | auto_dedupe | 300 | 3 | TRUE |
+  | pipeline_id | export_type | csv_url | bq_table_id | write_disposition | delimiter | encoding | skip_leading_rows | load_mode | window_days | dedupe_mode | data_type | add_ingestion_timestamp | ingestion_timestamp_column | snapshot_retention_mode | timeout_sec | retries | active |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | pipe_1 | orders | https://... | project.dataset.table | WRITE_APPEND | ; | utf-8 | 1 | auto | 30 | auto_dedupe | time_series | FALSE | | | 300 | 3 | TRUE |
+  | pipe_2 | products | https://... | project.dataset.products | WRITE_APPEND | ; | utf-8 | 1 | full | | | snapshot | TRUE | ingestion_timestamp | daily_latest | 300 | 3 | TRUE |
 
 Schema_Config tab:
   | export_type | name | type | mode | description | source | parse_logic |
@@ -122,6 +123,10 @@ class GoogleSheetsConfigProvider(ConfigProvider):
                     'load_mode': (row.get('load_mode', 'auto') or 'auto').strip().lower(),
                     'window_days': int(row.get('window_days', 30) or 30),
                     'dedupe_mode': (row.get('dedupe_mode', 'auto_dedupe') or 'auto_dedupe').strip().lower(),
+                    'data_type': (row.get('data_type', 'time_series') or 'time_series').strip().lower(),
+                    'add_ingestion_timestamp': self._clean_bool(row.get('add_ingestion_timestamp', 'FALSE')),
+                    'ingestion_timestamp_column': (row.get('ingestion_timestamp_column', 'ingestion_timestamp') or 'ingestion_timestamp').strip(),
+                    'snapshot_retention_mode': (row.get('snapshot_retention_mode', 'daily_latest') or 'daily_latest').strip().lower(),
                     'timeout_sec': int(row.get('timeout_sec', 300) or 300),
                     'retries': int(row.get('retries', 3) or 3),
                 }

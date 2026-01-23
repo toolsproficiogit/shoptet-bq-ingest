@@ -51,6 +51,14 @@ VALID_SCHEMA_MODES = {"strict", "auto_migrate", "recreate"}
 DEDUPE_MODES = {"no_dedupe", "auto_dedupe", "full_dedupe"}
 DEFAULT_DEDUPE_MODE = "auto_dedupe"
 
+# Data types
+DATA_TYPES = {"time_series", "snapshot"}
+DEFAULT_DATA_TYPE = "time_series"
+
+# Snapshot retention modes (only for data_type="snapshot")
+SNAPSHOT_RETENTION_MODES = {"latest_only", "all_snapshots", "daily_latest"}
+DEFAULT_SNAPSHOT_RETENTION = "daily_latest"
+
 # ======================================================================
 # PARSER FUNCTIONS
 # ======================================================================
@@ -427,6 +435,84 @@ def filter_by_last_days(
             result.append(row)
     
     return result
+
+
+def inject_ingestion_timestamp(
+    rows: List[Dict[str, Any]],
+    timestamp_column: str = "ingestion_timestamp"
+) -> List[Dict[str, Any]]:
+    """Inject ingestion timestamp into all rows for snapshot data."""
+    if not rows:
+        return rows
+    
+    now = datetime.now()
+    for row in rows:
+        row[timestamp_column] = now
+    
+    return rows
+
+
+def apply_snapshot_retention(
+    rows: List[Dict[str, Any]],
+    retention_mode: str,
+    key_fields: Optional[Tuple[str, ...]] = None,
+    timestamp_column: str = "ingestion_timestamp"
+) -> List[Dict[str, Any]]:
+    """
+    Apply snapshot-specific retention logic.
+    
+    Modes:
+    - latest_only: Keep only the latest snapshot per key (no history)
+    - all_snapshots: Keep all snapshots (for troubleshooting/sub-day comparisons)
+    - daily_latest: Keep only latest snapshot per day per key (default, balances history with storage)
+    """
+    if not rows or retention_mode == "all_snapshots":
+        return rows
+    
+    if not key_fields:
+        key_fields = _choose_keys(list(rows[0].keys()) if rows else [])
+    
+    if retention_mode == "latest_only":
+        # Keep only the latest snapshot per key (overall)
+        seen = {}
+        for row in rows:
+            key_val = tuple(row.get(k) for k in key_fields)
+            # Keep if we haven't seen this key, or if this row is newer
+            if key_val not in seen:
+                seen[key_val] = row
+            else:
+                existing_ts = seen[key_val].get(timestamp_column)
+                new_ts = row.get(timestamp_column)
+                if new_ts and existing_ts and new_ts > existing_ts:
+                    seen[key_val] = row
+        return list(seen.values())
+    
+    elif retention_mode == "daily_latest":
+        # Keep only the latest snapshot per day per key
+        seen = {}
+        for row in rows:
+            key_val = tuple(row.get(k) for k in key_fields)
+            ts = row.get(timestamp_column)
+            
+            # Extract date from timestamp for grouping
+            if isinstance(ts, datetime):
+                date_key = ts.date()
+            else:
+                date_key = datetime.now().date()
+            
+            composite_key = (key_val, date_key)
+            
+            # Keep if we haven't seen this key+date, or if this row is newer
+            if composite_key not in seen:
+                seen[composite_key] = row
+            else:
+                existing_ts = seen[composite_key].get(timestamp_column)
+                if ts and existing_ts and ts > existing_ts:
+                    seen[composite_key] = row
+        
+        return list(seen.values())
+    
+    return rows
 
 
 def apply_dedupe(
@@ -810,11 +896,25 @@ def process_pipeline(
     load_mode = (p.get("load_mode") or os.getenv("LOAD_MODE", "auto")).lower()
     window_days = int(p.get("window_days", os.getenv("WINDOW_DAYS", 30)))
     dedupe_mode = (p.get("dedupe_mode") or os.getenv("DEDUPE_MODE", DEFAULT_DEDUPE_MODE)).lower()
+    data_type = (p.get("data_type") or os.getenv("DATA_TYPE", DEFAULT_DATA_TYPE)).lower()
+    add_ingestion_timestamp = str(p.get("add_ingestion_timestamp", "false")).lower() == "true"
+    ingestion_timestamp_column = p.get("ingestion_timestamp_column", "ingestion_timestamp")
+    snapshot_retention_mode = (p.get("snapshot_retention_mode") or DEFAULT_SNAPSHOT_RETENTION).lower()
     
     # Validate dedupe mode
     if dedupe_mode not in DEDUPE_MODES:
         log.warning("Invalid dedupe_mode '%s' for pipeline %s, using default", dedupe_mode, pipeline_id)
         dedupe_mode = DEFAULT_DEDUPE_MODE
+    
+    # Validate data type
+    if data_type not in DATA_TYPES:
+        log.warning("Invalid data_type '%s' for pipeline %s, using default", data_type, pipeline_id)
+        data_type = DEFAULT_DATA_TYPE
+    
+    # Validate snapshot retention mode
+    if data_type == "snapshot" and snapshot_retention_mode not in SNAPSHOT_RETENTION_MODES:
+        log.warning("Invalid snapshot_retention_mode '%s' for pipeline %s, using default", snapshot_retention_mode, pipeline_id)
+        snapshot_retention_mode = DEFAULT_SNAPSHOT_RETENTION
     
     schema_def = schema_from_config(p, schema_lib)
     bq_fields = bq_fields_from_schema(schema_def)
@@ -916,12 +1016,24 @@ def process_pipeline(
         # Extract configured key fields for this pipeline
         configured_keys = extract_key_fields(p, schema_lib)
         
-        # Apply deduplication
-        if dedupe_mode != "no_dedupe":
-            # Use configured key fields if available, otherwise auto-detect
+        # Handle snapshot data type
+        if data_type == "snapshot":
+            # Inject ingestion timestamp for snapshot data
+            if add_ingestion_timestamp:
+                rows = inject_ingestion_timestamp(rows, ingestion_timestamp_column)
+                log.info("Pipeline %s: Injected ingestion timestamp column '%s'", pipeline_id, ingestion_timestamp_column)
+            
+            # Apply snapshot-specific retention logic
             key_fields = configured_keys or _choose_keys(list(rows[0].keys()) if rows else [])
-            rows = apply_dedupe(rows, dedupe_mode, key_fields)
-            log.info("Pipeline %s: Applied %s deduplication with key fields: %s", pipeline_id, dedupe_mode, key_fields)
+            rows = apply_snapshot_retention(rows, snapshot_retention_mode, key_fields, ingestion_timestamp_column)
+            log.info("Pipeline %s: Applied snapshot retention mode '%s' with key fields: %s", pipeline_id, snapshot_retention_mode, key_fields)
+        else:
+            # Apply regular deduplication for time-series data
+            if dedupe_mode != "no_dedupe":
+                # Use configured key fields if available, otherwise auto-detect
+                key_fields = configured_keys or _choose_keys(list(rows[0].keys()) if rows else [])
+                rows = apply_dedupe(rows, dedupe_mode, key_fields)
+                log.info("Pipeline %s: Applied %s deduplication with key fields: %s", pipeline_id, dedupe_mode, key_fields)
         
         # Load to staging
         staging = load_to_staging_batched(bq_cli, rows, table_id, bq_fields, BQ_LOCATION, schema_def=schema_def)

@@ -144,9 +144,17 @@ The script will prompt you to choose your configuration source and guide you thr
 
 ### Google Sheets: `Pipeline_Config` Tab
 
-| pipeline_id | export_type | csv_url | bq_table_id | delimiter | encoding | skip_leading_rows | load_mode | window_days | dedupe_mode | timeout_sec | retries | active |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| pipe_1 | orders | https://... | project.dataset.table | ; | utf-8 | 1 | auto | 30 | auto_dedupe | 300 | 3 | TRUE |
+**Time-series data (orders, customers, etc.):**
+
+| pipeline_id | export_type | csv_url | bq_table_id | delimiter | encoding | skip_leading_rows | load_mode | window_days | dedupe_mode | data_type | timeout_sec | retries | active |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| pipe_1 | orders | https://... | project.dataset.table | ; | utf-8 | 1 | auto | 30 | auto_dedupe | time_series | 300 | 3 | TRUE |
+
+**Snapshot data (products, current status, etc.):**
+
+| pipeline_id | export_type | csv_url | bq_table_id | delimiter | encoding | skip_leading_rows | load_mode | data_type | add_ingestion_timestamp | ingestion_timestamp_column | snapshot_retention_mode | timeout_sec | retries | active |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| pipe_2 | products | https://... | project.dataset.products | ; | utf-8 | 1 | full | snapshot | TRUE | ingestion_timestamp | daily_latest | 300 | 3 | TRUE |
 
 ### Google Sheets: `Schema_Config` Tab
 
@@ -343,7 +351,76 @@ Whether this pipeline should be executed. Set to `FALSE` to temporarily disable 
 
 Controls deduplication logic; when multiple rows have the same key combination, only the last occurrence is kept. Make sure all the key fields are configured in the Schema.
 
+
+
 ---
+
+## Snapshot Data Type (NEW)
+
+For static/current status data (e.g., product catalogs, current prices) instead of time-series data, use the `snapshot` data type with automatic ingestion timestamp tracking.
+
+### `data_type` (Optional)
+
+**Type:** String  
+**Default:** `time_series`  
+**Valid values:** `time_series`, `snapshot`
+
+Specifies the type of data being ingested:
+
+- **`time_series`**: Historical data with timestamps (orders, customer activity, etc.). Uses `dedupe_mode` for deduplication.
+- **`snapshot`**: Current status/static data without inherent timestamps (products, prices, etc.). Uses `snapshot_retention_mode` for retention.
+
+### `add_ingestion_timestamp` (Optional, snapshot only)
+
+**Type:** Boolean  
+**Default:** `FALSE`  
+**Valid values:** `TRUE`, `FALSE`
+
+When set to `TRUE` for snapshot data, automatically adds an ingestion timestamp column to every row. This allows tracking when each snapshot was captured and enables historical comparisons.
+
+### `ingestion_timestamp_column` (Optional, snapshot only)
+
+**Type:** String  
+**Default:** `ingestion_timestamp`  
+**Example:** `ingestion_timestamp`, `snapshot_date`, `captured_at`
+
+Name of the column that will contain the ingestion timestamp. Only used when `add_ingestion_timestamp` is `TRUE`.
+
+### `snapshot_retention_mode` (Optional, snapshot only)
+
+**Type:** String  
+**Default:** `daily_latest`  
+**Valid values:** `latest_only`, `all_snapshots`, `daily_latest`
+
+Controls how many snapshots are retained in the table:
+
+- **`latest_only`**: Keep only the most recent snapshot per product (no history). Table always contains current status only.
+- **`all_snapshots`**: Keep all snapshots (for troubleshooting and sub-day comparisons). Useful for detailed analysis but storage grows quickly.
+- **`daily_latest`**: Keep only the latest snapshot per day per product (default). Balances history with storage efficiency. Recommended for most use cases.
+
+### Example: Product Snapshot Pipeline
+
+```
+Pipeline_Config row:
+| pipe_products | products | https://shoptet.cz/export/products.csv | project.dataset.products | ; | utf-8 | 1 | full | | | snapshot | TRUE | ingestion_timestamp | daily_latest | 300 | 3 | TRUE |
+
+Schema_Config rows:
+| products | product_id | STRING | NULLABLE | Product ID | product_id | string | product_id |
+| products | name | STRING | NULLABLE | Product Name | name | string | |
+| products | price | FLOAT | NULLABLE | Current Price | price | decimal_comma | |
+| products | stock | INTEGER | NULLABLE | Stock Level | stock | integer | |
+```
+
+**How it works:**
+
+1. CSV is downloaded with current product data (no date column)
+2. Ingestion timestamp is automatically added to each row
+3. Key field is `product_id,ingestion_timestamp` (composite key)
+4. With `daily_latest` mode: only one record per product per day is kept
+5. Query current status: `SELECT * FROM products WHERE ingestion_timestamp = (SELECT MAX(ingestion_timestamp) FROM products)`
+6. Query historical snapshots: `SELECT * FROM products WHERE DATE(ingestion_timestamp) = '2026-01-23' ORDER BY product_id`
+
+------
 
 ## Schema Configuration Fields
 
