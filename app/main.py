@@ -184,7 +184,8 @@ def build_row_from_record(
 
 def _coerce_for_json(
     rows: List[Dict[str, Any]], 
-    schema_def: Optional[List[Dict[str, Any]]] = None
+    schema_def: Optional[List[Dict[str, Any]]] = None,
+    pipeline_id: str = ""
 ) -> List[Dict[str, Any]]:
     """
     Coerce row data to JSON-serializable format, enforcing types based on schema.
@@ -953,9 +954,16 @@ def process_pipeline(
         filtered_count = 0
         try:
             reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
-            for csv_record in reader:
+            for csv_idx, csv_record in enumerate(reader):
                 if not csv_record or all(v is None or v == "" for v in csv_record.values()):
                     continue
+                
+                # Debug: Log the raw CSV record structure for first row
+                if csv_idx == 0:
+                    log.debug(f"Pipeline {pipeline_id}: Raw CSV record keys: {list(csv_record.keys())}")
+                    log.debug(f"Pipeline {pipeline_id}: Raw CSV record sample: {dict(list(csv_record.items())[:5])}")
+                    if 'code' in csv_record:
+                        log.debug(f"Pipeline {pipeline_id}: CSV 'code' field value: {repr(csv_record['code'])}")
                 
                 # Build row using schema parsers
                 row = build_row_from_record(csv_record, schema_def, pipeline_id)
