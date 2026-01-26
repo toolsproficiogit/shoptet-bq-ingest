@@ -1052,10 +1052,27 @@ def process_pipeline(
         
         # Handle snapshot data type
         if data_type == "snapshot":
+            log.debug(f"Pipeline {pipeline_id}: Processing snapshot data type")
             # Inject ingestion timestamp for snapshot data
             if add_ingestion_timestamp:
                 rows = inject_ingestion_timestamp(rows, ingestion_timestamp_column)
                 log.info("Pipeline %s: Injected ingestion timestamp column '%s'", pipeline_id, ingestion_timestamp_column)
+                
+                # Calculate date_only from the injected ingestion timestamp
+                log.debug(f"Pipeline {pipeline_id}: Starting date_only calculation for {len(rows)} rows")
+                date_only_count = 0
+                for row_idx, row in enumerate(rows):
+                    if ingestion_timestamp_column in row and row[ingestion_timestamp_column] is not None:
+                        row["date_only"] = parse_date_only(row[ingestion_timestamp_column])
+                        date_only_count += 1
+                        if row_idx == 0:
+                            log.debug(f"Pipeline {pipeline_id}: date_only calculated from {ingestion_timestamp_column} = {repr(row['date_only'])}")
+                    else:
+                        row["date_only"] = None
+                        if row_idx == 0:
+                            log.debug(f"Pipeline {pipeline_id}: Could not calculate date_only - {ingestion_timestamp_column} is None or missing")
+                
+                log.debug(f"Pipeline {pipeline_id}: Calculated date_only for {date_only_count}/{len(rows)} rows")
             
             # Apply snapshot-specific retention logic
             key_fields = configured_keys or _choose_keys(list(rows[0].keys()) if rows else [])
