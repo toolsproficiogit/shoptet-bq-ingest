@@ -954,6 +954,13 @@ def process_pipeline(
         filtered_count = 0
         try:
             reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
+            
+            # Log the CSV header row
+            if reader.fieldnames:
+                log.debug(f"Pipeline {pipeline_id}: CSV header fieldnames: {reader.fieldnames}")
+                log.debug(f"Pipeline {pipeline_id}: CSV header fieldnames (repr): {repr(reader.fieldnames)}")
+                log.debug(f"Pipeline {pipeline_id}: Number of fields in CSV: {len(reader.fieldnames)}")
+            
             for csv_idx, csv_record in enumerate(reader):
                 if not csv_record or all(v is None or v == "" for v in csv_record.values()):
                     continue
@@ -961,9 +968,16 @@ def process_pipeline(
                 # Debug: Log the raw CSV record structure for first row
                 if csv_idx == 0:
                     log.debug(f"Pipeline {pipeline_id}: Raw CSV record keys: {list(csv_record.keys())}")
+                    log.debug(f"Pipeline {pipeline_id}: Raw CSV record keys (repr): {repr(list(csv_record.keys()))}")
                     log.debug(f"Pipeline {pipeline_id}: Raw CSV record sample: {dict(list(csv_record.items())[:5])}")
+                    # Check all possible variations of 'code' field
+                    for key in csv_record.keys():
+                        if 'code' in key.lower():
+                            log.debug(f"Pipeline {pipeline_id}: Found code-like field '{key}' = {repr(csv_record[key])}")
                     if 'code' in csv_record:
                         log.debug(f"Pipeline {pipeline_id}: CSV 'code' field value: {repr(csv_record['code'])}")
+                    else:
+                        log.debug(f"Pipeline {pipeline_id}: 'code' field NOT found in CSV record")
                 
                 # Build row using schema parsers
                 row = build_row_from_record(csv_record, schema_def, pipeline_id)
