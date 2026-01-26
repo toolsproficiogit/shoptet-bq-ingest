@@ -165,21 +165,28 @@ def build_row_from_record(
             parsed_value = parser(raw_value)
             row[name] = parsed_value
             
-            # Debug logging for decimal_comma fields
-            if parser_key == "decimal_comma" and raw_value and parsed_value is not None:
-                log.debug(f"Pipeline {pipeline_id}: Field {name} - raw={raw_value} -> parsed={parsed_value}")
+            # Debug logging for all fields (not just decimal_comma)
+            if raw_value is not None and raw_value != "":
+                log.debug(f"Pipeline {pipeline_id}: Field {name} (source={source}, parse={parser_key}) - raw={repr(raw_value)} -> parsed={repr(parsed_value)}")
+            elif parsed_value is None:
+                log.debug(f"Pipeline {pipeline_id}: Field {name} (source={source}, parse={parser_key}) - raw={repr(raw_value)} -> PARSED AS NULL")
         else:
             # No source means this is a computed/generated field
             row[name] = None
+            log.debug(f"Pipeline {pipeline_id}: Field {name} - NO SOURCE (computed field)")
     
     # Add identifier
     row["identifier"] = pipeline_id
     
-    # Add date_only if date field exists
-    if "date" in row and row["date"] is not None:
-        row["date_only"] = parse_date_only(row["date"])
-    else:
-        row["date_only"] = None
+    # Add date_only - try multiple date field names
+    date_only_value = None
+    for date_field in ["date", "ingestion_time"]:
+        if date_field in row and row[date_field] is not None:
+            date_only_value = parse_date_only(row[date_field])
+            log.debug(f"Pipeline {pipeline_id}: date_only calculated from {date_field} = {repr(date_only_value)}")
+            break
+    
+    row["date_only"] = date_only_value
     
     return row
 
@@ -448,6 +455,8 @@ def inject_ingestion_timestamp(
     now = datetime.now()
     for row in rows:
         row[timestamp_column] = now
+    
+    log.debug(f"Injected timestamp column '{timestamp_column}' with value {repr(now)} to {len(rows)} rows")
     
     return rows
 
@@ -1012,6 +1021,13 @@ def process_pipeline(
                 "rows_loaded": 0,
                 "message": f"No rows to load (filtered {filtered_count} old rows)" if effective_mode == "window" else "No rows to load",
             }
+        
+        # Debug: Log first row structure
+        if rows:
+            first_row = rows[0]
+            log.debug(f"Pipeline {pipeline_id}: First row structure (keys={list(first_row.keys())})")
+            for key, val in first_row.items():
+                log.debug(f"  {key} = {repr(val)}")
         
         # Extract configured key fields for this pipeline
         configured_keys = extract_key_fields(p, schema_lib)
