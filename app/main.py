@@ -148,6 +148,8 @@ def build_row_from_record(
     """
     Build a row from a CSV record using the schema definition.
     Applies appropriate parsers to each field based on the 'parse' type.
+    Only processes fields that have a 'source' defined (CSV fields).
+    Skips computed fields like ingestion_time and date_only.
     """
     row: Dict[str, Any] = {}
     
@@ -156,37 +158,26 @@ def build_row_from_record(
         source = field_def.get("source")
         parser_key = field_def.get("parse", "string")
         
+        # Skip fields without source - these are computed/injected fields
+        if not source:
+            continue
+        
         # Get the parser function for this field type
         parser = PARSERS.get(parser_key, PARSERS["string"])
         
         # Apply parser to the source field value
-        if source:
-            raw_value = rec.get(source)
-            parsed_value = parser(raw_value)
-            row[name] = parsed_value
-            
-            # Debug logging for all fields (not just decimal_comma)
-            if raw_value is not None and raw_value != "":
-                log.debug(f"Pipeline {pipeline_id}: Field {name} (source={source}, parse={parser_key}) - raw={repr(raw_value)} -> parsed={repr(parsed_value)}")
-            elif parsed_value is None:
-                log.debug(f"Pipeline {pipeline_id}: Field {name} (source={source}, parse={parser_key}) - raw={repr(raw_value)} -> PARSED AS NULL")
-        else:
-            # No source means this is a computed/generated field
-            row[name] = None
-            log.debug(f"Pipeline {pipeline_id}: Field {name} - NO SOURCE (computed field)")
+        raw_value = rec.get(source)
+        parsed_value = parser(raw_value)
+        row[name] = parsed_value
+        
+        # Debug logging for all fields (not just decimal_comma)
+        if raw_value is not None and raw_value != "":
+            log.debug(f"Pipeline {pipeline_id}: Field {name} (source={source}, parse={parser_key}) - raw={repr(raw_value)} -> parsed={repr(parsed_value)}")
+        elif parsed_value is None:
+            log.debug(f"Pipeline {pipeline_id}: Field {name} (source={source}, parse={parser_key}) - raw={repr(raw_value)} -> PARSED AS NULL")
     
     # Add identifier
     row["identifier"] = pipeline_id
-    
-    # Add date_only - try multiple date field names
-    date_only_value = None
-    for date_field in ["date", "ingestion_time"]:
-        if date_field in row and row[date_field] is not None:
-            date_only_value = parse_date_only(row[date_field])
-            log.debug(f"Pipeline {pipeline_id}: date_only calculated from {date_field} = {repr(date_only_value)}")
-            break
-    
-    row["date_only"] = date_only_value
     
     return row
 
