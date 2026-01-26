@@ -953,6 +953,11 @@ def process_pipeline(
         rows = []
         filtered_count = 0
         try:
+            # Strip UTF-8 BOM if present
+            if csv_text.startswith('﻿'):
+                csv_text = csv_text[1:]
+                log.debug(f"Pipeline {pipeline_id}: Stripped UTF-8 BOM from CSV")
+            
             reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
             
             # Log the CSV header row
