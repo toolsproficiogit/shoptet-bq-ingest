@@ -1079,6 +1079,28 @@ def process_pipeline(
             rows = apply_snapshot_retention(rows, snapshot_retention_mode, key_fields, ingestion_timestamp_column)
             log.info("Pipeline %s: Applied snapshot retention mode '%s' with key fields: %s", pipeline_id, snapshot_retention_mode, key_fields)
         else:
+            # For non-snapshot (time-series) data, calculate date_only from date field if present
+            log.debug(f"Pipeline {pipeline_id}: Processing time-series data type")
+            date_only_count = 0
+            for row_idx, row in enumerate(rows):
+                # Look for a date/timestamp field to calculate date_only from
+                date_value = None
+                for field_name in ["date", "created_at", "updated_at", "timestamp"]:
+                    if field_name in row and row[field_name] is not None:
+                        date_value = row[field_name]
+                        break
+                
+                if date_value is not None:
+                    row["date_only"] = parse_date_only(date_value)
+                    date_only_count += 1
+                    if row_idx == 0:
+                        log.debug(f"Pipeline {pipeline_id}: date_only calculated from date field = {repr(row['date_only'])}")
+                else:
+                    row["date_only"] = None
+            
+            if date_only_count > 0:
+                log.debug(f"Pipeline {pipeline_id}: Calculated date_only for {date_only_count}/{len(rows)} rows")
+            
             # Apply regular deduplication for time-series data
             if dedupe_mode != "no_dedupe":
                 # Use configured key fields if available, otherwise auto-detect
