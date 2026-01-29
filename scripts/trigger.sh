@@ -3,7 +3,20 @@ set -euo pipefail
 
 REGION=${REGION:-europe-west1}
 SERVICE=${SERVICE:-csv-bq-multi}
-EXTRA_QS="${1:-}"  # e.g. '?allow_unknown=1' or '?pipeline=my_id&allow_unknown=1'
+EXTRA_QS=""
+
+# Parse arguments
+if [ $# -gt 0 ] && [[ "$1" != "?"* ]]; then
+    # First argument is service name (if it doesn't start with ?)
+    SERVICE="$1"
+    EXTRA_QS="${2:-}"
+else
+    # First argument is query string
+    EXTRA_QS="${1:-}"
+fi
+
+echo "Service: $SERVICE" >&2
+echo "Region: $REGION" >&2
 
 SERVICE_URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')
 ID_TOKEN=$(gcloud auth print-identity-token)

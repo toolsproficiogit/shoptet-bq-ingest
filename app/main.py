@@ -47,6 +47,10 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1048576"))
 SCHEMA_MIGRATION_MODE = os.getenv("SCHEMA_MIGRATION_MODE", "strict").lower()
 VALID_SCHEMA_MODES = {"strict", "auto_migrate", "recreate"}
 
+# Multi-service hash-based distribution
+PIPELINE_HASH_MOD = int(os.getenv("PIPELINE_HASH_MOD", "1"))
+PIPELINE_HASH_REMAINDER = int(os.getenv("PIPELINE_HASH_REMAINDER", "0"))
+
 # Deduplication modes
 DEDUPE_MODES = {"no_dedupe", "auto_dedupe", "full_dedupe"}
 DEFAULT_DEDUPE_MODE = "auto_dedupe"
@@ -690,6 +694,24 @@ def merge_staging(
     return 0
 
 
+def should_process_pipeline(pipeline_id: str) -> bool:
+    """
+    Determine if this service should process the given pipeline based on hash-based distribution.
+    Uses hash(pipeline_id) % PIPELINE_HASH_MOD == PIPELINE_HASH_REMAINDER
+    """
+    if PIPELINE_HASH_MOD <= 1:
+        # Single service mode - process all pipelines
+        return True
+    
+    pipeline_hash = hash(pipeline_id) % PIPELINE_HASH_MOD
+    should_process = pipeline_hash == PIPELINE_HASH_REMAINDER
+    
+    if not should_process:
+        log.debug(f"Skipping pipeline {pipeline_id}: hash={pipeline_hash}, remainder={PIPELINE_HASH_REMAINDER}")
+    
+    return should_process
+
+
 def extract_key_fields(
     pipeline_cfg: Dict[str, Any],
     schema_lib: Dict[str, List[Dict[str, Any]]],
@@ -1121,7 +1143,13 @@ def process_pipeline(
             }
         
         # Merge staging to target with configured key fields
-        merge_staging(bq_cli, staging, table_id, dedupe_mode, BQ_LOCATION, key_fields=configured_keys)
+        # For snapshot data with daily_latest mode, include date_only in the merge key
+        merge_key_fields = configured_keys
+        if data_type == "snapshot" and snapshot_retention_mode == "daily_latest":
+            merge_key_fields = tuple(list(configured_keys or []) + ["date_only"]) if configured_keys else ("date_only",)
+            log.debug(f"Pipeline {pipeline_id}: Using composite merge key for snapshot daily_latest: {merge_key_fields}")
+        
+        merge_staging(bq_cli, staging, table_id, dedupe_mode, BQ_LOCATION, key_fields=merge_key_fields)
         
         rows_count = len(rows)
         log.info(f"Pipeline {pipeline_id}: Successfully loaded {rows_count} rows (mode={effective_mode}, filtered {filtered_count} old rows)")
@@ -1164,12 +1192,26 @@ def trigger():
         
         # Process each pipeline
         results = []
+        skipped_count = 0
         for pipeline in pipelines:
             if pipeline.get("active", True) is False:
                 continue
             
+            pipeline_id = pipeline.get("pipeline_id", "unknown")
+            
+            # Check if this service should process this pipeline
+            if not should_process_pipeline(pipeline_id):
+                skipped_count += 1
+                continue
+            
             result = process_pipeline(pipeline, schema_lib, allow_unknown, migration_mode)
             results.append(result)
+        
+        if PIPELINE_HASH_MOD > 1 and skipped_count > 0:
+            log.info(f"Service {PIPELINE_HASH_REMAINDER}/{PIPELINE_HASH_MOD}: Skipped {skipped_count} pipelines")
+        
+        if PIPELINE_HASH_MOD > 1:
+            log.info(f"Service {PIPELINE_HASH_REMAINDER}/{PIPELINE_HASH_MOD}: Processed {len(results)} pipelines")
         
         return {
             "status": "ok",

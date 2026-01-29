@@ -9,6 +9,11 @@ set -e
 # ======================================================================
 
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+# Support service name as first argument (for multi-service setup)
+if [ $# -gt 0 ] && [[ ! "$1" =~ ^-- ]]; then
+    SERVICE_NAME="$1"
+    shift
+fi
 SERVICE_NAME="${SERVICE_NAME:-csv-bq-multi}"
 REGION="${REGION:-europe-west1}"
 
@@ -20,6 +25,7 @@ print_header() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
     echo "║  Update Cloud Run Service Environment Variables            ║"
+    echo "║  Service: $SERVICE_NAME                                    ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
 }
@@ -100,8 +106,10 @@ interactive_mode() {
     echo "6) DEDUPE_MODE (deduplication strategy)"
     echo "7) WINDOW_DAYS (days to keep in window mode)"
     echo "8) Custom variable"
+    echo "9) PIPELINE_HASH_MOD (multi-service: total services)"
+    echo "10) PIPELINE_HASH_REMAINDER (multi-service: this service number)"
     echo ""
-    read -p "Enter choice (1-8): " choice
+    read -p "Enter choice (1-10): " choice
     
     case $choice in
         1)
@@ -211,6 +219,28 @@ interactive_mode() {
             read -p "Enter variable name: " var_name
             read -p "Enter variable value: " var_value
             update_single_var "$var_name" "$var_value"
+            ;;
+        9)
+            echo ""
+            echo "Current PIPELINE_HASH_MOD:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='PIPELINE_HASH_MOD'].value)" || echo "Not set"
+            echo ""
+            read -p "Enter value (total number of services): " value
+            update_single_var "PIPELINE_HASH_MOD" "$value"
+            ;;
+        10)
+            echo ""
+            echo "Current PIPELINE_HASH_REMAINDER:"
+            gcloud run services describe "$SERVICE_NAME" \
+                --region="$REGION" \
+                --project="$PROJECT_ID" \
+                --format="value(spec.template.spec.containers[0].env[?name=='PIPELINE_HASH_REMAINDER'].value)" || echo "Not set"
+            echo ""
+            read -p "Enter value (this service's number, 0-indexed): " value
+            update_single_var "PIPELINE_HASH_REMAINDER" "$value"
             ;;
         *)
             echo "Invalid choice"

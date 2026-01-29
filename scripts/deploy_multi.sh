@@ -26,6 +26,8 @@ CONFIG_SOURCE=""
 CONFIG_URL=""
 SCHEMA_URL=""
 CONFIG_SHEET_ID=""
+PIPELINE_HASH_MOD="${PIPELINE_HASH_MOD:-1}"
+PIPELINE_HASH_REMAINDER="${PIPELINE_HASH_REMAINDER:-0}"
 
 # ======================================================================
 # FUNCTIONS
@@ -160,6 +162,8 @@ build_and_deploy() {
     ENV_VARS="$ENV_VARS,BQ_LOCATION=EU"
     ENV_VARS="$ENV_VARS,ALLOW_UNKNOWN_COLUMNS=$ALLOW_UNKNOWN_COLUMNS"
     ENV_VARS="$ENV_VARS,SCHEMA_MIGRATION_MODE=$SCHEMA_MIGRATION_MODE"
+    ENV_VARS="$ENV_VARS,PIPELINE_HASH_MOD=$PIPELINE_HASH_MOD"
+    ENV_VARS="$ENV_VARS,PIPELINE_HASH_REMAINDER=$PIPELINE_HASH_REMAINDER"
     
     if [ "$USE_SOURCE_SHEETS" = "true" ]; then
         ENV_VARS="$ENV_VARS,USE_SOURCE_SHEETS=true"
@@ -207,12 +211,46 @@ print_summary() {
     echo "Settings:"
     echo "  Allow Unknown Columns:   $ALLOW_UNKNOWN_COLUMNS"
     echo "  Schema Migration Mode:   $SCHEMA_MIGRATION_MODE"
+    if [ "$PIPELINE_HASH_MOD" -gt 1 ]; then
+        echo "  Multi-Service Mode:      Enabled"
+        echo "    Total Services:        $PIPELINE_HASH_MOD"
+        echo "    This Service:          $PIPELINE_HASH_REMAINDER"
+    else
+        echo "  Multi-Service Mode:      Disabled (single service)"
+    fi
     echo ""
     echo "Next steps:"
     echo "  1. Test the service: ./scripts/trigger.sh"
     echo "  2. View logs: gcloud run logs read $SERVICE_NAME --limit 50"
     echo "  3. Update env vars: ./scripts/update_env.sh"
     echo ""
+}
+
+prompt_multi_service_config() {
+    echo ""
+    echo "Multi-service deployment (hash-based distribution):"
+    echo "  - Single service (default): PIPELINE_HASH_MOD=1"
+    echo "  - Multiple services: Set PIPELINE_HASH_MOD to total number of services"
+    echo ""
+    read -p "Enter total number of services [1]: " hash_mod
+    hash_mod=${hash_mod:-1}
+    PIPELINE_HASH_MOD="$hash_mod"
+    
+    if [ "$PIPELINE_HASH_MOD" -gt 1 ]; then
+        echo ""
+        echo "This is service number (0 to $((PIPELINE_HASH_MOD - 1))):"
+        read -p "Enter service number [0]: " hash_remainder
+        hash_remainder=${hash_remainder:-0}
+        PIPELINE_HASH_REMAINDER="$hash_remainder"
+        
+        echo ""
+        echo "Multi-service configuration:"
+        echo "  Total services:        $PIPELINE_HASH_MOD"
+        echo "  This service number:   $PIPELINE_HASH_REMAINDER"
+        echo "  Service name suffix:   -$PIPELINE_HASH_REMAINDER"
+        
+        SERVICE_NAME="${SERVICE_NAME}-${PIPELINE_HASH_REMAINDER}"
+    fi
 }
 
 # ======================================================================
@@ -229,6 +267,7 @@ main() {
     echo "Additional Settings:"
     prompt_allow_unknown_columns
     prompt_schema_migration_mode
+    prompt_multi_service_config
     
     echo ""
     echo "Validating inputs..."
