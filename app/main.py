@@ -667,7 +667,9 @@ def merge_staging(
         insert_values = ", ".join([f"S.{f}" for f in insert_cols])
         
         # ON clause: match by all key fields
-        on_clause = " AND ".join([f"T.{k} = S.{k}" for k in key_fields])
+        # Use IS NOT DISTINCT FROM to handle NULL values correctly
+        # (NULL IS NOT DISTINCT FROM NULL evaluates to TRUE)
+        on_clause = " AND ".join([f"T.{k} IS NOT DISTINCT FROM S.{k}" for k in key_fields])
         
         query = f"""
         MERGE `{target_table}` T
