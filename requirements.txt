@@ -3,7 +3,7 @@ gunicorn==25.1.0
 
 # HTTP + retries
 requests==2.31.0
-urllib3==2.1.0
+urllib3==2.6.3
 
 # YAML config support
 pyyaml>=6.0
