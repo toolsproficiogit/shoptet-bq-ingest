@@ -18,4 +18,4 @@ google-cloud-bigquery>=3.0.0
 google-api-core==2.17.0
 
 # Optional: ensures CSV parsing always works
-google-cloud-core==2.4.1
+google-cloud-core==2.5.0
