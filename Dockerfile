@@ -26,6 +26,10 @@ ENV BATCH_SIZE=5000 \
     CHUNK_SIZE=1048576 \
     DEDUPE_MODE=auto_dedupe
 
+# Security: run as non-root user
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+USER appuser
+
 # Start via gunicorn with optimized worker configuration
 # - workers: number of worker processes (Cloud Run auto-scales)
 # - threads: threads per worker for I/O-bound operations
