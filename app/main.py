@@ -700,16 +700,16 @@ def merge_staging(
 def should_process_pipeline(pipeline_id: str) -> bool:
     """
     Determine if this service should process the given pipeline based on hash-based distribution.
-    Uses deterministic MD5 hash to ensure consistent distribution across service restarts.
-    Formula: int(MD5(pipeline_id)) % PIPELINE_HASH_MOD == PIPELINE_HASH_REMAINDER
+    Uses deterministic SHA-256 hash to ensure consistent distribution across service restarts.
+    Formula: int(SHA256(pipeline_id)) % PIPELINE_HASH_MOD == PIPELINE_HASH_REMAINDER
     """
     if PIPELINE_HASH_MOD <= 1:
         # Single service mode - process all pipelines
         return True
     
-    # Use MD5 hash for deterministic results (consistent across restarts and machines)
+    # Use SHA-256 hash for deterministic results (consistent across restarts and machines)
     # Python's built-in hash() is non-deterministic and changes between process restarts
-    pipeline_hash = int(hashlib.md5(pipeline_id.encode()).hexdigest(), 16) % PIPELINE_HASH_MOD
+    pipeline_hash = int(hashlib.sha256(pipeline_id.encode()).hexdigest(), 16) % PIPELINE_HASH_MOD
     should_process = pipeline_hash == PIPELINE_HASH_REMAINDER
     
     if not should_process:
@@ -1234,4 +1234,4 @@ def trigger():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="127.0.0.1", port=8080, debug=False)
