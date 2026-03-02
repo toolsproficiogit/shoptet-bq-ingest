@@ -43,6 +43,8 @@ log = logging.getLogger(__name__)
 BQ_LOCATION = os.getenv("BQ_LOCATION", "EU")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5000"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1048576"))
+RECONCILE_ON_KEY_CHANGE = os.getenv("RECONCILE_ON_KEY_CHANGE", "true").lower() == "true"
+PIPELINE_STATE_TABLE_NAME = os.getenv("PIPELINE_STATE_TABLE_NAME", "_pipeline_state")
 
 # Schema migration strategy
 SCHEMA_MIGRATION_MODE = os.getenv("SCHEMA_MIGRATION_MODE", "strict").lower()
@@ -610,18 +612,196 @@ def load_to_staging_batched(
     return staging
 
 
+def _quote_col(name: str) -> str:
+    """Quote a column name for BigQuery SQL."""
+    return f"`{name}`"
+
+
+def _normalize_key_signature(key_fields: Tuple[str, ...]) -> str:
+    """Serialize key fields into a stable signature string."""
+    return ",".join(key_fields)
+
+
+def _build_row_order_expr(fields: List[str]) -> str:
+    """
+    Build deterministic ordering expression for deduplication winner selection.
+    Prefer update/ingestion timestamps if present, then fallback to row hash.
+    """
+    priority_fields = [
+        "updated_at",
+        "update_time",
+        "ingestion_timestamp",
+        "timestamp",
+        "date",
+        "created_at",
+    ]
+    present = [f for f in priority_fields if f in fields]
+    if present:
+        parts = [f"{_quote_col(f)} DESC" for f in present]
+        parts.append("FARM_FINGERPRINT(TO_JSON_STRING(row_data)) DESC")
+        return ", ".join(parts)
+    return "FARM_FINGERPRINT(TO_JSON_STRING(row_data)) DESC"
+
+
+def _ensure_pipeline_state_table(bq: bigquery.Client, target_table: str) -> str:
+    """Ensure per-dataset pipeline state table exists and return its fully-qualified ID."""
+    dataset = ".".join(target_table.split(".")[:2])
+    state_table_id = f"{dataset}.{PIPELINE_STATE_TABLE_NAME}"
+    schema = [
+        bigquery.SchemaField("pipeline_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("target_table", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("key_signature", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
+    ]
+    try:
+        bq.get_table(state_table_id)
+    except Exception as e:
+        if "Not found" in str(e) or "404" in str(e):
+            bq.create_table(bigquery.Table(state_table_id, schema=schema))
+            log.info("Created pipeline state table %s", state_table_id)
+        else:
+            raise
+    return state_table_id
+
+
+def _get_previous_key_signature(
+    bq: bigquery.Client,
+    state_table_id: str,
+    pipeline_id: str,
+    target_table: str,
+    location: str,
+) -> Optional[str]:
+    """Fetch previously stored key signature for a pipeline+target combination."""
+    query = f"""
+    SELECT key_signature
+    FROM `{state_table_id}`
+    WHERE pipeline_id = @pipeline_id
+      AND target_table = @target_table
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("pipeline_id", "STRING", pipeline_id),
+            bigquery.ScalarQueryParameter("target_table", "STRING", target_table),
+        ]
+    )
+    rows = list(bq.query(query, location=location, job_config=job_config).result())
+    return rows[0]["key_signature"] if rows else None
+
+
+def _store_key_signature(
+    bq: bigquery.Client,
+    state_table_id: str,
+    pipeline_id: str,
+    target_table: str,
+    key_signature: str,
+    location: str,
+) -> None:
+    """Upsert the current key signature for a pipeline+target combination."""
+    query = f"""
+    MERGE `{state_table_id}` T
+    USING (
+        SELECT
+            @pipeline_id AS pipeline_id,
+            @target_table AS target_table,
+            @key_signature AS key_signature,
+            CURRENT_TIMESTAMP() AS updated_at
+    ) S
+    ON T.pipeline_id = S.pipeline_id
+       AND T.target_table = S.target_table
+    WHEN MATCHED THEN
+      UPDATE SET key_signature = S.key_signature, updated_at = S.updated_at
+    WHEN NOT MATCHED THEN
+      INSERT (pipeline_id, target_table, key_signature, updated_at)
+      VALUES (S.pipeline_id, S.target_table, S.key_signature, S.updated_at)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("pipeline_id", "STRING", pipeline_id),
+            bigquery.ScalarQueryParameter("target_table", "STRING", target_table),
+            bigquery.ScalarQueryParameter("key_signature", "STRING", key_signature),
+        ]
+    )
+    bq.query(query, location=location, job_config=job_config).result()
+
+
+def reconcile_target_by_keys(
+    bq: bigquery.Client,
+    target_table: str,
+    location: str,
+    key_fields: Tuple[str, ...],
+) -> None:
+    """
+    Reconcile target table by current key fields.
+    Keeps a single winner row per key and rewrites table content in-place.
+    """
+    tgt = bq.get_table(target_table)
+    target_fields = [f.name for f in tgt.schema]
+    select_sql = ", ".join([_quote_col(f) for f in target_fields])
+    partition_sql = ", ".join([_quote_col(k) for k in key_fields])
+    order_sql = _build_row_order_expr(target_fields)
+
+    query = f"""
+    CREATE TEMP TABLE _dedup_target AS
+    SELECT {select_sql}
+    FROM (
+      SELECT {select_sql},
+             ROW_NUMBER() OVER (
+               PARTITION BY {partition_sql}
+               ORDER BY {order_sql}
+             ) AS rn
+      FROM `{target_table}` AS row_data
+    )
+    WHERE rn = 1;
+
+    TRUNCATE TABLE `{target_table}`;
+
+    INSERT INTO `{target_table}` ({select_sql})
+    SELECT {select_sql}
+    FROM _dedup_target;
+    """
+    log.info("Reconciling existing rows in %s by keys: %s", target_table, key_fields)
+    bq.query(query, location=location).result()
+    log.info("Finished reconciliation for %s", target_table)
+
+
+def _has_duplicates_by_keys(
+    bq: bigquery.Client,
+    target_table: str,
+    location: str,
+    key_fields: Tuple[str, ...],
+) -> bool:
+    """Check if target contains duplicate key groups."""
+    partition_sql = ", ".join([_quote_col(k) for k in key_fields])
+    query = f"""
+    SELECT 1
+    FROM `{target_table}`
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY {partition_sql}
+      ORDER BY 1
+    ) > 1
+    LIMIT 1
+    """
+    rows = list(bq.query(query, location=location).result())
+    return len(rows) > 0
+
+
 def merge_staging(
     bq: bigquery.Client,
     staging_table: str,
     target_table: str,
     dedupe_mode: str,
     location: str,
+    pipeline_id: str,
     key_fields: Optional[Tuple[str, ...]] = None,
 ) -> int:
     """
-    Merge staging table to target using MERGE statement.
-    This implements upsert logic: UPDATE existing rows (by key), INSERT new rows.
-    Preserves full history in target table while updating recent data from staging.
+    Replace-by-key from staging into target using current configured key fields.
+    1) Deduplicate staging by keys (winner = latest by timestamp/hash ordering)
+    2) Delete matching keys from target
+    3) Insert deduplicated staging rows
+    Also performs one-time reconciliation when key fields change.
     """
     try:
         # Get schema information from both tables
@@ -631,60 +811,115 @@ def merge_staging(
         target_fields = [f.name for f in tgt.schema]
         staging_fields = [f.name for f in stg.schema]
         
-        # Determine key fields for MERGE (id, product_id, order_id, etc.)
+        # Determine key fields (id, product_id, order_id, etc.)
         # Use configured key_fields if provided, otherwise auto-detect
         if not key_fields:
             key_fields = _choose_keys(target_fields)
-        key_set = set(key_fields)
+        missing_in_target = [k for k in key_fields if k not in target_fields]
+        missing_in_staging = [k for k in key_fields if k not in staging_fields]
+        if missing_in_target or missing_in_staging:
+            raise ValueError(
+                f"Key fields mismatch for target={target_table}, staging={staging_table}, "
+                f"missing_in_target={missing_in_target}, missing_in_staging={missing_in_staging}"
+            )
         
-        log.info("Using key fields for MERGE: %s", key_fields)
+        log.info("Using key fields for replace-by-key: %s", key_fields)
         
-        # Common fields (excluding keys) to update
-        common_fields = [f for f in target_fields if f in staging_fields and f not in key_set]
-        
-        # Build MERGE statement with defensive deduplication
-        # Use ROW_NUMBER to keep only the LAST occurrence of each key in staging
-        select_cols = list(key_fields) + common_fields
-        select_sql = ", ".join(select_cols)
-        
-        # Add ROW_NUMBER to deduplicate by key, keeping the last row
-        row_num_partition = ", ".join(key_fields) if key_fields else "1"
-        dedup_sql = f"""SELECT {select_sql}
-        FROM (
-            SELECT {select_sql},
-                   ROW_NUMBER() OVER (PARTITION BY {row_num_partition} ORDER BY 1 DESC) as rn
-            FROM `{staging_table}`
+        # Persist/retrieve key signature for change detection
+        current_key_signature = _normalize_key_signature(key_fields)
+        state_table_id = _ensure_pipeline_state_table(bq, target_table)
+        previous_key_signature = _get_previous_key_signature(
+            bq=bq,
+            state_table_id=state_table_id,
+            pipeline_id=pipeline_id,
+            target_table=target_table,
+            location=location,
         )
-        WHERE rn = 1"""
-        
-        # UPDATE clause: set all common fields
-        update_sets = ", ".join([f"T.{f} = S.{f}" for f in common_fields]) if common_fields else ""
-        update_clause = f"WHEN MATCHED THEN UPDATE SET {update_sets}" if update_sets else ""
-        
-        # INSERT clause: insert keys and common fields
-        insert_cols = list(key_fields) + common_fields
-        insert_fields = ", ".join(insert_cols)
-        insert_values = ", ".join([f"S.{f}" for f in insert_cols])
-        
-        # ON clause: match by all key fields
-        # Use IS NOT DISTINCT FROM to handle NULL values correctly
-        # (NULL IS NOT DISTINCT FROM NULL evaluates to TRUE)
-        on_clause = " AND ".join([f"T.{k} IS NOT DISTINCT FROM S.{k}" for k in key_fields])
-        
+        key_changed = previous_key_signature is not None and previous_key_signature != current_key_signature
+
+        if key_changed and RECONCILE_ON_KEY_CHANGE:
+            log.warning(
+                "Detected key change for pipeline %s on table %s: '%s' -> '%s'. Starting reconciliation.",
+                pipeline_id,
+                target_table,
+                previous_key_signature,
+                current_key_signature,
+            )
+            reconcile_target_by_keys(
+                bq=bq,
+                target_table=target_table,
+                location=location,
+                key_fields=key_fields,
+            )
+        elif previous_key_signature is None and RECONCILE_ON_KEY_CHANGE:
+            # First run with state tracking enabled: reconcile once only if duplicates already exist.
+            if _has_duplicates_by_keys(bq, target_table, location, key_fields):
+                log.warning(
+                    "No previous key signature for pipeline %s on table %s, but duplicate keys exist. "
+                    "Running one-time reconciliation for keys: %s",
+                    pipeline_id,
+                    target_table,
+                    key_fields,
+                )
+                reconcile_target_by_keys(
+                    bq=bq,
+                    target_table=target_table,
+                    location=location,
+                    key_fields=key_fields,
+                )
+
+        # Insert all fields common to target and staging in target order.
+        insert_cols = [f for f in target_fields if f in staging_fields]
+        if not insert_cols:
+            raise ValueError(f"No common columns between staging ({staging_table}) and target ({target_table})")
+        insert_cols_sql = ", ".join([_quote_col(f) for f in insert_cols])
+        partition_sql = ", ".join([_quote_col(k) for k in key_fields])
+        order_sql = _build_row_order_expr(insert_cols)
+
+        # Build null-safe key matching clause
+        on_clause = " AND ".join([f"T.{_quote_col(k)} IS NOT DISTINCT FROM S.{_quote_col(k)}" for k in key_fields])
+
         query = f"""
-        MERGE `{target_table}` T
-        USING ({dedup_sql}) S
-        ON {on_clause}
-        {update_clause}
-        WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({insert_values});
+        CREATE TEMP TABLE _dedup_source AS
+        SELECT {insert_cols_sql}
+        FROM (
+            SELECT {insert_cols_sql},
+                   ROW_NUMBER() OVER (
+                     PARTITION BY {partition_sql}
+                     ORDER BY {order_sql}
+                   ) AS rn
+            FROM `{staging_table}` AS row_data
+        )
+        WHERE rn = 1;
+
+        BEGIN TRANSACTION;
+          DELETE FROM `{target_table}` T
+          WHERE EXISTS (
+            SELECT 1
+            FROM _dedup_source S
+            WHERE {on_clause}
+          );
+
+          INSERT INTO `{target_table}` ({insert_cols_sql})
+          SELECT {insert_cols_sql}
+          FROM _dedup_source;
+        COMMIT TRANSACTION;
         """
-        
-        log.info("Executing MERGE for %s with key fields: %s", target_table, key_fields)
+
+        log.info("Executing replace-by-key for %s with key fields: %s", target_table, key_fields)
         bq.query(query, location=location).result()
-        log.info("MERGE completed for %s", target_table)
+        _store_key_signature(
+            bq=bq,
+            state_table_id=state_table_id,
+            pipeline_id=pipeline_id,
+            target_table=target_table,
+            key_signature=current_key_signature,
+            location=location,
+        )
+        log.info("Replace-by-key completed for %s", target_table)
         
     except Exception as e:
-        log.exception("Error during merge for %s: %s", target_table, e)
+        log.exception("Error during replace-by-key for %s: %s", target_table, e)
         raise
     finally:
         # Clean up staging table
@@ -1155,7 +1390,15 @@ def process_pipeline(
             merge_key_fields = tuple(list(configured_keys or []) + ["date_only"]) if configured_keys else ("date_only",)
             log.debug(f"Pipeline {pipeline_id}: Using composite merge key for snapshot daily_latest: {merge_key_fields}")
         
-        merge_staging(bq_cli, staging, table_id, dedupe_mode, BQ_LOCATION, key_fields=merge_key_fields)
+        merge_staging(
+            bq=bq_cli,
+            staging_table=staging,
+            target_table=table_id,
+            dedupe_mode=dedupe_mode,
+            location=BQ_LOCATION,
+            pipeline_id=pipeline_id,
+            key_fields=merge_key_fields,
+        )
         
         rows_count = len(rows)
         log.info(f"Pipeline {pipeline_id}: Successfully loaded {rows_count} rows (mode={effective_mode}, filtered {filtered_count} old rows)")
