@@ -893,12 +893,14 @@ def merge_staging(
         partition_sql = ", ".join([_quote_col(k) for k in key_fields])
         order_sql = _build_row_order_expr(insert_cols)
 
-        # Build null-safe key matching clause
-        on_clause = " AND ".join([f"T.{_quote_col(k)} IS NOT DISTINCT FROM S.{_quote_col(k)}" for k in key_fields])
+        # Build a deterministic composite join key for equality-based DELETE matching.
+        key_struct_sql = ", ".join([_quote_col(k) for k in key_fields])
 
         query = f"""
         CREATE TEMP TABLE _dedup_source AS
-        SELECT {insert_cols_sql}
+        SELECT
+            {insert_cols_sql},
+            TO_JSON_STRING(STRUCT({key_struct_sql})) AS __join_key
         FROM (
             SELECT {insert_cols_sql},
                    ROW_NUMBER() OVER (
@@ -911,11 +913,8 @@ def merge_staging(
 
         BEGIN TRANSACTION;
           DELETE FROM `{target_table}` T
-          WHERE EXISTS (
-            SELECT 1
-            FROM _dedup_source S
-            WHERE {on_clause}
-          );
+          WHERE TO_JSON_STRING(STRUCT({", ".join([f"T.{_quote_col(k)}" for k in key_fields])}))
+                IN (SELECT __join_key FROM _dedup_source);
 
           INSERT INTO `{target_table}` ({insert_cols_sql})
           SELECT {insert_cols_sql}
