@@ -147,6 +147,23 @@ def _choose_keys(field_names: List[str]) -> Tuple[str, ...]:
     return (field_names[0],) if field_names else ("id",)
 
 
+def parse_bool_value(value: Any, default: bool = True) -> bool:
+    """Normalize mixed boolean-like values from config sources."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "1", "yes", "y", "on"}:
+            return True
+        if v in {"false", "0", "no", "n", "off"}:
+            return False
+    return default
+
+
 def build_row_from_record(
     rec: Dict[str, Any], 
     schema_def: List[Dict[str, Any]], 
@@ -1077,6 +1094,7 @@ class GoogleSheetsConfigProvider(ConfigProvider):
             pipelines = []
             for record in records:
                 if record.get("pipeline_id"):
+                    record["active"] = parse_bool_value(record.get("active"), default=True)
                     pipelines.append(record)
             
             return pipelines
@@ -1443,7 +1461,7 @@ def trigger():
         results = []
         skipped_count = 0
         for pipeline in pipelines:
-            if pipeline.get("active", True) is False:
+            if not parse_bool_value(pipeline.get("active"), default=True):
                 continue
             
             pipeline_id = pipeline.get("pipeline_id", "unknown")
