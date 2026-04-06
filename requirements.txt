@@ -2,7 +2,7 @@ Flask==3.0.2
 gunicorn==25.1.0
 
 # HTTP + retries
-requests==2.32.5
+requests==2.33.1
 urllib3==2.6.3
 
 # YAML config support
