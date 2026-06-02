@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import yaml
@@ -108,9 +108,10 @@ def parse_datetime(s: Optional[Union[str, datetime]]) -> Optional[datetime]:
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
-    # Try ISO format with timezone
+    # Try ISO format with timezone. Normalize any tz-aware result to naive UTC
+    # so downstream comparisons never mix offset-aware and offset-naive datetimes.
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return _normalize_datetime_for_compare(datetime.fromisoformat(s.replace("Z", "+00:00")))
     except (ValueError, AttributeError):
         pass
     return None
@@ -120,6 +121,63 @@ def parse_date_only(s: Optional[Union[str, datetime]]) -> Optional[str]:
     """Parse date string and return as ISO date string (YYYY-MM-DD)."""
     dt = s if isinstance(s, datetime) else parse_datetime(s)
     return dt.date().isoformat() if dt else None
+
+
+def _utcnow_naive() -> datetime:
+    """Return current UTC timestamp as naive datetime for safe comparisons."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _normalize_datetime_for_compare(dt: datetime) -> datetime:
+    """Normalize datetime to naive UTC for robust aware/naive comparisons."""
+    if dt.tzinfo is not None and dt.utcoffset() is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def normalize_csv_header_name(name: Any) -> str:
+    """
+    Normalize CSV header names for matching.
+    Examples: "[CREATION_TIME]" -> "CREATION_TIME", " ORDER_NUMBER " -> "ORDER_NUMBER".
+    """
+    s = str(name).strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+    return s
+
+
+def normalize_csv_record_keys(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of a CSV record with normalized keys."""
+    out: Dict[str, Any] = {}
+    for key, value in rec.items():
+        if key is None:
+            continue
+        out[normalize_csv_header_name(key)] = value
+    return out
+
+
+def get_record_value(rec: Dict[str, Any], source: Any) -> Any:
+    """Read a field value from CSV record with forgiving source/header matching."""
+    if source is None:
+        return None
+    if source in rec:
+        return rec[source]
+    source_s = str(source).strip()
+    if not source_s:
+        return None
+
+    # Try common bracketed/unbracketed variants.
+    candidate_keys = [source_s, normalize_csv_header_name(source_s), f"[{normalize_csv_header_name(source_s)}]"]
+    for cand in candidate_keys:
+        if cand in rec:
+            return rec[cand]
+
+    # Case-insensitive fallback.
+    source_lower = normalize_csv_header_name(source_s).lower()
+    for key, value in rec.items():
+        if normalize_csv_header_name(key).lower() == source_lower:
+            return value
+    return None
 
 
 # Parser registry - maps parse type names to parser functions
@@ -190,7 +248,7 @@ def build_row_from_record(
         parser = PARSERS.get(parser_key, PARSERS["string"])
         
         # Apply parser to the source field value
-        raw_value = rec.get(source)
+        raw_value = get_record_value(rec, source)
         parsed_value = parser(raw_value)
         row[name] = parsed_value
         
@@ -438,19 +496,22 @@ def filter_by_last_days(
     if not rows or days <= 0:
         return rows
     
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = _utcnow_naive() - timedelta(days=days)
     result = []
     
     for row in rows:
         dt = row.get(date_field)
         if dt is None:
             continue
-        if isinstance(dt, datetime) and dt >= cutoff:
-            result.append(row)
+        if isinstance(dt, datetime):
+            dt_cmp = _normalize_datetime_for_compare(dt)
+            if dt_cmp >= cutoff:
+                result.append(row)
         elif isinstance(dt, str):
             try:
                 dt_obj = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-                if dt_obj >= cutoff:
+                dt_cmp = _normalize_datetime_for_compare(dt_obj)
+                if dt_cmp >= cutoff:
                     result.append(row)
             except Exception:
                 result.append(row)
@@ -1176,6 +1237,15 @@ def process_pipeline(
     
     load_mode = (p.get("load_mode") or os.getenv("LOAD_MODE", "auto")).lower()
     window_days = int(p.get("window_days", os.getenv("WINDOW_DAYS", 30)))
+    delimiter = p.get("delimiter", ";")
+    if isinstance(delimiter, str):
+        delimiter = "\t" if delimiter == "\\t" else delimiter
+    else:
+        delimiter = ";"
+    encoding = str(p.get("encoding", "utf-8") or "utf-8").strip().lower()
+    skip_leading_rows = int(p.get("skip_leading_rows", 1) or 1)
+    timeout_sec = int(p.get("timeout_sec", os.getenv("CSV_TIMEOUT_SEC", 300)) or 300)
+    retries = int(p.get("retries", os.getenv("CSV_RETRIES", 3)) or 3)
     dedupe_mode = (p.get("dedupe_mode") or os.getenv("DEDUPE_MODE", DEFAULT_DEDUPE_MODE)).lower()
     data_type = (p.get("data_type") or os.getenv("DATA_TYPE", DEFAULT_DATA_TYPE)).lower()
     add_ingestion_timestamp = str(p.get("add_ingestion_timestamp", "false")).lower() == "true"
@@ -1217,9 +1287,34 @@ def process_pipeline(
         # Fetch CSV
         try:
             import requests
-            resp = requests.get(csv_url, timeout=300)
-            resp.raise_for_status()
-            csv_text = resp.text
+            # Honor per-pipeline timeout_sec and retries (with exponential backoff).
+            # retries = number of additional attempts after the first.
+            resp = None
+            last_err: Optional[Exception] = None
+            for attempt in range(retries + 1):
+                try:
+                    resp = requests.get(csv_url, timeout=timeout_sec)
+                    resp.raise_for_status()
+                    last_err = None
+                    break
+                except Exception as fetch_err:
+                    last_err = fetch_err
+                    if attempt < retries:
+                        backoff = 2 ** attempt
+                        log.warning(
+                            "Pipeline %s: CSV fetch attempt %d/%d failed: %s; retrying in %ds",
+                            pipeline_id, attempt + 1, retries + 1, fetch_err, backoff,
+                        )
+                        time.sleep(backoff)
+            if last_err is not None:
+                raise last_err
+            # Decode CSV using configured encoding when provided.
+            # "auto" uses requests/chardet-detected encoding if available.
+            if encoding == "auto":
+                detected_encoding = resp.encoding or resp.apparent_encoding or "utf-8"
+                csv_text = resp.content.decode(detected_encoding, errors="replace")
+            else:
+                csv_text = resp.content.decode(encoding, errors="replace")
         except Exception as e:
             log.exception("Failed to fetch CSV for pipeline %s: %s", pipeline_id, e)
             return {
@@ -1234,11 +1329,17 @@ def process_pipeline(
         filtered_count = 0
         try:
             # Strip UTF-8 BOM if present
-            if csv_text.startswith('﻿'):
+            if csv_text.startswith("\ufeff"):
                 csv_text = csv_text[1:]
                 log.debug(f"Pipeline {pipeline_id}: Stripped UTF-8 BOM from CSV")
-            
-            reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
+
+            csv_stream = io.StringIO(csv_text)
+            # skip_leading_rows=1 means the first row is the header row.
+            for _ in range(max(0, skip_leading_rows - 1)):
+                if csv_stream.readline() == "":
+                    break
+
+            reader = csv.DictReader(csv_stream, delimiter=delimiter)
             
             # Log the CSV header row
             if reader.fieldnames:
@@ -1265,7 +1366,8 @@ def process_pipeline(
                         log.debug(f"Pipeline {pipeline_id}: 'code' field NOT found in CSV record")
                 
                 # Build row using schema parsers
-                row = build_row_from_record(csv_record, schema_def, pipeline_id)
+                normalized_csv_record = normalize_csv_record_keys(csv_record)
+                row = build_row_from_record(normalized_csv_record, schema_def, pipeline_id)
                 
                 # Filter by window if needed
                 if effective_mode == "window":
@@ -1280,8 +1382,9 @@ def process_pipeline(
                     
                     if dt:
                         if isinstance(dt, datetime):
-                            cutoff = datetime.now() - timedelta(days=window_days)
-                            if dt < cutoff:
+                            dt_cmp = _normalize_datetime_for_compare(dt)
+                            cutoff = _utcnow_naive() - timedelta(days=window_days)
+                            if dt_cmp < cutoff:
                                 filtered_count += 1
                                 continue
                         elif isinstance(dt, str):
@@ -1289,8 +1392,9 @@ def process_pipeline(
                             try:
                                 dt_obj = parse_datetime(dt)
                                 if dt_obj:
-                                    cutoff = datetime.now() - timedelta(days=window_days)
-                                    if dt_obj < cutoff:
+                                    dt_cmp = _normalize_datetime_for_compare(dt_obj)
+                                    cutoff = _utcnow_naive() - timedelta(days=window_days)
+                                    if dt_cmp < cutoff:
                                         filtered_count += 1
                                         continue
                             except:
@@ -1365,7 +1469,7 @@ def process_pipeline(
             for row_idx, row in enumerate(rows):
                 # Look for a date/timestamp field to calculate date_only from
                 date_value = None
-                for field_name in ["date", "created_at", "updated_at", "timestamp"]:
+                for field_name in ["date", "created_at", "creation_time", "paid_date", "updated_at", "timestamp"]:
                     if field_name in row and row[field_name] is not None:
                         date_value = row[field_name]
                         break
@@ -1495,3 +1599,4 @@ def trigger():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False)
+
